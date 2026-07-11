@@ -40,6 +40,9 @@ import sys
 import json
 import base64
 import time
+import subprocess
+import tempfile
+import shlex
 
 # --- PyInstaller --noconsole 修正：無終端機時 sys.stdout/stderr 為 None ---
 # uvicorn 的 logging 設定會呼叫 stream.isatty()，None 沒有這個方法會直接崩潰，
@@ -523,19 +526,85 @@ def detect_target_regions(img01, radius=40.0, sensitivity=1.0):
     return mask
 
 
-def apply_local_target_boost(img01, enable, strength, radius, sensitivity):
+def build_manual_target_mask(h, w, x_pct, y_pct, w_pct, h_pct, weight, feather_pct, shape="rectangle"):
+    """把使用者手動框選的區域轉換成 0~1 柔和遮罩，供 apply_local_target_boost 與自動遮罩合併。
+
+    座標系統採用「百分比」而非絕對像素，因此無論套用在全解析度原圖或縮圖預覽上，
+    框選的相對位置與大小都一致，不需要額外依 preview_scale 換算。
+
+    shape 支援兩種：
+      - "rectangle"：矩形框選（原本的行為）。
+      - "ellipse"：橢圓框選，寬高百分比相等時就是正圓，不需要另外做「圓形」選項。
+
+    做法：
+      1. 依中心點百分比 (x_pct, y_pct) 與寬高百分比 (w_pct, h_pct) 算出區域的像素邊界/半軸長。
+      2. 區域內填入 weight（0~1，代表這塊區域被判定為「目標」的程度），區域外為 0。
+      3. 用 gaussian_filter 羽化邊緣（sigma 依區域短邊的 feather_pct% 決定），
+         避免手動框選區域出現生硬的邊界（矩形的直角、橢圓的邊緣皆適用）。
+    """
+    x0 = w * x_pct / 100.0
+    y0 = h * y_pct / 100.0
+    rw = max(2.0, w * w_pct / 100.0)
+    rh = max(2.0, h * h_pct / 100.0)
+
+    mask = np.zeros((h, w), dtype=np.float32)
+    w_clip = float(np.clip(weight, 0.0, 1.0))
+
+    if shape == "ellipse":
+        # 以 (x0, y0) 為中心、半軸長 (rw/2, rh/2) 的橢圓遮罩；rw == rh 時即為正圓。
+        yy, xx = np.ogrid[:h, :w]
+        norm = ((xx - x0) / (rw / 2.0)) ** 2 + ((yy - y0) / (rh / 2.0)) ** 2
+        mask[norm <= 1.0] = w_clip
+    else:
+        x_min = int(round(max(0, x0 - rw / 2.0)))
+        x_max = int(round(min(w, x0 + rw / 2.0)))
+        y_min = int(round(max(0, y0 - rh / 2.0)))
+        y_max = int(round(min(h, y0 + rh / 2.0)))
+        if x_max > x_min and y_max > y_min:
+            mask[y_min:y_max, x_min:x_max] = w_clip
+
+    if feather_pct > 0:
+        feather_sigma = max(0.5, min(rw, rh) * (feather_pct / 100.0))
+        mask = gaussian_filter(mask, sigma=feather_sigma)
+
+    return np.clip(mask, 0.0, 1.0)
+
+
+def apply_local_target_boost(img01, enable, strength, radius, sensitivity,
+                              manual_enable=False, manual_x_pct=50.0, manual_y_pct=50.0,
+                              manual_w_pct=25.0, manual_h_pct=25.0,
+                              manual_weight=1.0, manual_feather_pct=20.0,
+                              manual_shape="rectangle"):
     """在自動偵測到的目標區域(星雲/銀河等)內加強局部對比，天空背景則幾乎不受影響。
 
-    做法：對亮度做一次大半徑的 unsharp-mask(clarity 概念)，但套用強度依 detect_target_regions()
-    算出的遮罩逐像素加權——遮罩值高(有結構的區域)才吃到明顯的對比增強，
-    遮罩值接近 0 的平坦天空背景幾乎不變，藉此取代「整張圖統一拉伸」的做法。
+    做法：對亮度做一次大半徑的 unsharp-mask(clarity 概念)，但套用強度依遮罩逐像素加權——
+    遮罩值高(有結構的區域)才吃到明顯的對比增強，遮罩值接近 0 的平坦天空背景幾乎不變，
+    藉此取代「整張圖統一拉伸」的做法。
     色彩維持方式與 remove_background_gradient() 相同：只算亮度的增減比例，
     再乘回三個色版，避免整體色偏。
+
+    遮罩來源有兩個，取兩者逐像素最大值（聯集）合併：
+      1. 自動遮罩：detect_target_regions() 自動偵測有結構的區域（enable 控制是否計算）。
+      2. 手動遮罩：build_manual_target_mask() 依使用者框選的矩形位置產生（manual_enable 控制），
+         用來覆蓋自動偵測漏掉的微弱目標，或是使用者想強制加強的特定區域。
+    手動遮罩可獨立於自動偵測開關使用：即使自動偵測關閉，仍可只用手動框選的區域加強。
     """
-    if not enable or strength <= 0:
+    if strength <= 0 or (not enable and not manual_enable):
         return img01, None
 
-    mask = detect_target_regions(img01, radius=radius, sensitivity=sensitivity)
+    h, w = img01.shape[:2]
+    mask = detect_target_regions(img01, radius=radius, sensitivity=sensitivity) if enable else np.zeros((h, w), dtype=np.float32)
+
+    if manual_enable:
+        manual_mask = build_manual_target_mask(
+            h, w, manual_x_pct, manual_y_pct, manual_w_pct, manual_h_pct,
+            manual_weight, manual_feather_pct, shape=manual_shape,
+        )
+        mask = np.maximum(mask, manual_mask)
+
+    if not np.any(mask > 1e-4):
+        return img01, None
+
     lum = img01[:, :, 0] * 0.299 + img01[:, :, 1] * 0.587 + img01[:, :, 2] * 0.114
     blur = gaussian_filter(lum, sigma=max(2.0, radius))
     detail = lum - blur
@@ -573,16 +642,131 @@ def apply_clarity_and_sharpen(img8, clarity_blur, clarity_strength, sharpen_blur
     return np.clip(sharpened, 0, 255).astype(np.uint8)
 
 
-def denoise(img8, enable, mode, d, sigma_color, sigma_space, nlm_h, nlm_h_color):
+# ============================================================
+# ============= 方案 A：ML 降噪 / 去星 外部工具介接 ================
+# ============================================================
+# 設計依據：OPTIMIZATION_PLAN_v1_2_0.md「ML 降噪 / ML 去星」低優先項目下的
+# 「方案 A（外部工具介接）技術評估」。本程式不內建、不重新散布任何第三方 ML
+# 模型或安裝檔，只負責呼叫使用者電腦上「自行安裝、自行取得授權」的外部命令列
+# 工具（例如 RC-Astro NoiseXTerminator / StarXTerminator CLI、DeepSNR、
+# Cosmic Clarity 等），授權責任在使用者自己身上。
+#
+# 資料流：img01(記憶體陣列) → 寫成暫存 16-bit TIFF → subprocess 呼叫外部 CLI
+#        → 讀回輸出檔 → 轉回 img01 供後續 pipeline 步驟接手。
+_EXTERNAL_TOOL_TIMEOUT_SEC = 180
+
+
+def run_external_image_tool(img01, exe_path, extra_args, timeout=_EXTERNAL_TOOL_TIMEOUT_SEC):
+    """呼叫外部命令列工具處理一張影像（方案 A：外部工具介接）。
+
+    img01: float32 [0,1] RGB numpy 陣列 (H, W, 3)。
+    exe_path: 使用者在設定欄位指定的外部工具執行檔路徑（使用者自行安裝/授權）。
+    extra_args: 額外命令列參數字串。若包含 {input} / {output} 佔位符，會替換成
+        實際暫存檔路徑；若未包含，則相容「exe [options] <輸入檔> <輸出檔>」這種
+        多數 CLI 常見慣例，自動把輸入/輸出檔路徑附加在參數字串最後。
+
+    回傳 (out_img01, error_message)：
+        成功時 error_message 為 None；失敗時 out_img01 為 None，error_message
+        帶有可直接顯示給使用者看的失敗原因，呼叫端應該「跳過該步驟」而非讓
+        整條 pipeline 或整個 batch 中斷（對應複核筆記的錯誤處理與降級策略）。
+    """
+    if not exe_path or not str(exe_path).strip():
+        return None, "尚未設定外部工具執行檔路徑（External tool path not configured）"
+    exe_path = str(exe_path).strip()
+    if not os.path.isfile(exe_path):
+        return None, f"找不到外部工具執行檔：{exe_path}"
+
+    tmp_dir = tempfile.mkdtemp(prefix="astro_ext_")
+    in_path = os.path.join(tmp_dir, "input.tif")
+    out_path = os.path.join(tmp_dir, "output.tif")
+    try:
+        # 寫成 16-bit TIFF 暫存檔，避免先損失動態範圍再交給外部工具處理
+        img16 = (np.clip(img01, 0, 1) * 65535.0).astype(np.uint16)
+        tifffile.imwrite(in_path, img16)
+
+        try:
+            arg_tokens = shlex.split(extra_args) if extra_args else []
+        except ValueError as e:
+            return None, f"額外命令列參數格式錯誤：{e}"
+
+        if any(("{input}" in t) or ("{output}" in t) for t in arg_tokens):
+            arg_tokens = [t.replace("{input}", in_path).replace("{output}", out_path) for t in arg_tokens]
+            cmd = [exe_path] + arg_tokens
+        else:
+            cmd = [exe_path] + arg_tokens + [in_path, out_path]
+
+        try:
+            result = subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
+        except subprocess.TimeoutExpired:
+            return None, f"外部工具執行逾時（超過 {timeout} 秒）"
+        except FileNotFoundError:
+            return None, f"無法執行外部工具：{exe_path}"
+        except OSError as e:
+            return None, f"呼叫外部工具失敗：{e}"
+
+        if result.returncode != 0:
+            stderr_tail = (result.stderr or "").strip()[-300:]
+            extra = f"：{stderr_tail}" if stderr_tail else ""
+            return None, f"外部工具回傳非 0 錯誤代碼 ({result.returncode}){extra}"
+
+        if not os.path.isfile(out_path):
+            return None, "外部工具執行完畢，但找不到輸出檔案，請確認額外參數設定是否正確"
+
+        try:
+            out16 = tifffile.imread(out_path)
+        except Exception as e:
+            return None, f"讀取外部工具輸出檔失敗：{e}"
+
+        if out16.ndim == 2:
+            out16 = np.stack([out16] * 3, axis=-1)
+        if out16.shape[-1] == 4:
+            out16 = out16[:, :, :3]
+
+        if out16.dtype == np.uint16:
+            out01 = out16.astype(np.float32) / 65535.0
+        elif out16.dtype == np.uint8:
+            out01 = out16.astype(np.float32) / 255.0
+        else:
+            out01 = np.clip(out16.astype(np.float32), 0.0, 1.0)
+
+        if out01.shape[:2] != img01.shape[:2]:
+            out01 = cv2.resize(out01, (img01.shape[1], img01.shape[0]), interpolation=cv2.INTER_CUBIC)
+
+        return np.clip(out01, 0.0, 1.0).astype(np.float32), None
+    finally:
+        for f in (in_path, out_path):
+            try:
+                if os.path.isfile(f):
+                    os.remove(f)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
+
+
+def denoise(img8, enable, mode, d, sigma_color, sigma_space, nlm_h, nlm_h_color,
+            ext_path="", ext_args=""):
     """降噪。
 
     mode = "fast"（預設）：雙邊濾波(bilateralFilter)，速度快，適合即時預覽與一般使用。
     mode = "quality"：cv2.fastNlMeansDenoisingColored，屬於 Non-local Means 演算法，
         會在整張圖搜尋相似的小區塊來平均，降噪效果通常比雙邊濾波乾淨、更能保留細節邊緣，
         但運算量遠高於雙邊濾波（一般會慢上數倍到十倍以上），較適合最終高解析度匯出而非即時預覽。
+    mode = "external"：方案 A 外部工具介接——呼叫使用者指定的外部降噪 CLI
+        （例如 NoiseXTerminator / DeepSNR CLI）處理，失敗時直接跳過本步驟並
+        回傳原圖（未降噪），不中斷 pipeline，也不會靜默改用 fast/quality 頂替。
     """
     if not enable:
         return img8
+    if mode == "external":
+        img01 = img8.astype(np.float32) / 255.0
+        out01, err = run_external_image_tool(img01, ext_path, ext_args)
+        if err is not None:
+            print(f"[外部降噪 external denoise] 已跳過，改用原圖（未降噪）: {err}")
+            return img8
+        return (np.clip(out01, 0, 1) * 255).astype(np.uint8)
     if mode == "quality":
         return cv2.fastNlMeansDenoisingColored(
             img8, None,
@@ -873,6 +1057,14 @@ def process_stars(mode, img01, star_mask, cluster_mask, p):
             img01, star_mask, cluster_mask, p['star_inpaint_radius'], p['cluster_inpaint_radius'],
             feather_px=p.get('star_feather_px', 2.0), noise_strength=p.get('star_noise_strength', 1.0),
         )
+    elif mode == "external":
+        # 方案 A 外部工具介接——呼叫使用者指定的外部去星 CLI（例如 StarXTerminator/StarNet CLI）。
+        # 失敗時直接跳過本步驟並回傳原圖（未去星），不中斷 pipeline。
+        out01, err = run_external_image_tool(img01, p.get('star_ext_path', ''), p.get('star_ext_args', ''))
+        if err is not None:
+            print(f"[外部去星 external star removal] 已跳過，改用原圖（未去星）: {err}")
+            return img01
+        return out01
     elif mode == "none":
         return img01
     return img01
@@ -904,6 +1096,8 @@ def finish_pipeline(img01, p):
             sigma_space=p['denoise_sigma_space'],
             nlm_h=p.get('denoise_nlm_h', 10),
             nlm_h_color=p.get('denoise_nlm_h_color', 10),
+            ext_path=p.get('denoise_ext_path', ''),
+            ext_args=p.get('denoise_ext_args', ''),
         )
         img_work = img8_tmp.astype(np.float32) / 255.0
 
@@ -985,6 +1179,14 @@ def run_pipeline(img01, p, want_layers=False, preview_scale=1.0):
         p.get('local_target_strength', 0.0),
         p.get('local_target_radius', 40),
         p.get('local_target_sensitivity', 1.0),
+        p.get('manual_target_enable', False),
+        p.get('manual_target_x_pct', 50.0),
+        p.get('manual_target_y_pct', 50.0),
+        p.get('manual_target_w_pct', 25.0),
+        p.get('manual_target_h_pct', 25.0),
+        p.get('manual_target_weight', 1.0),
+        p.get('manual_target_feather_pct', 20.0),
+        p.get('manual_target_shape', 'rectangle'),
     )
     pre_star_img = img
 
@@ -1184,6 +1386,13 @@ PARAM_NAMES = [
     'multiscale_enable', 'cluster_kernel', 'cluster_thresh', 'cluster_min_area', 'cluster_max_area',
     'cluster_aspect', 'cluster_dilate', 'cluster_inpaint_radius',
     'star_feather_px', 'star_noise_strength',
+    'manual_target_enable', 'manual_target_x_pct', 'manual_target_y_pct',
+    'manual_target_w_pct', 'manual_target_h_pct', 'manual_target_weight', 'manual_target_feather_pct',
+    'manual_target_shape',
+    # 方案 A：ML 降噪 / ML 去星 外部工具介接（附加在最後，避免動到既有參數的索引位置，
+    # 例如 DEFAULTS[24]/DEFAULTS[43] 這類直接以索引取值的地方）
+    'denoise_ext_path', 'denoise_ext_args',
+    'star_ext_path', 'star_ext_args',
 ]
 
 DEFAULTS = [
@@ -1200,6 +1409,10 @@ DEFAULTS = [
     True, 21, 12, 300, 15000,
     2.5, 4, 14,
     2.0, 1.0,
+    False, 50.0, 50.0, 25.0, 25.0, 1.0, 20.0,
+    "rectangle",
+    "", "",
+    "", "",
 ]
 
 def collect_params(values):
@@ -1271,8 +1484,9 @@ def apply_preset_fn(preset_key, lang):
 # ============================================================
 # 讓使用者可以把「目前這組參數」暫存到 A / B / C 三個快取格，
 # 快速在 2-3 組候選設定間切換比較，而不用每次都手動記/調參數。
-# 快照只存在瀏覽器工作階段(gr.State)中，不寫入磁碟，重新整理頁面就會清空——
-# 若要長期保存，仍建議使用既有的「匯出當前參數(JSON)」功能。
+# 快照本身（gr.State）只存在瀏覽器工作階段中，不寫入磁碟，重新整理頁面就會清空；
+# 若想長期保存，可以用下面的「快照存成檔案 / 從檔案載入快照」，
+# 或既有的「匯出當前參數(JSON)」功能。
 
 def save_snapshot_fn(slot_label, lang, *param_values):
     p = collect_params(param_values)
@@ -1290,15 +1504,37 @@ def load_snapshot_fn(snapshot, slot_label, lang):
     msg = f"📥 已套用快照 {slot_label}" if lang == "zh" else f"📥 Snapshot {slot_label} applied"
     return updates + [msg]
 
+
+def _sanitize_filename_component(name):
+    """把使用者輸入的自由文字轉成安全的檔名片段：
+    僅保留中日韓文字、英數字、底線、連字號、空白（空白轉底線），其餘字元一律捨棄；
+    避免路徑穿越字元（/ \\ .. 等）造成寫到非預期的路徑。空字串或全部被濾掉時回傳 None，
+    交由呼叫端套用預設檔名。"""
+    if not name:
+        return None
+    import re
+    name = name.strip().replace(" ", "_")
+    name = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff\u3040-\u30ff]", "", name)
+    name = name.strip("._-")
+    return name[:60] if name else None
+
+
 # ============================================================
 # ========================= 參數匯入/匯出 =========================
 # ============================================================
+# 檔名採「參數化」設計：使用者可選填一個名稱，匯出時會反映在檔名裡
+# （例如 astro_config_後院光害.json），不填則沿用預設檔名 astro_config.json。
+# 這是必要的前提修正——舊版固定寫死 astro_config.json，若使用者連續匯出
+# 多組不同參數，後面的匯出會直接覆蓋前一個，且下面的「具名快照存檔」也需要
+# 靠檔名區分彼此，才不會互相覆蓋。
 
-def export_config_fn(*param_values):
+def export_config_fn(cfg_name, *param_values):
     p = collect_params(param_values)
     out_dir = _default_output_base()
     os.makedirs(out_dir, exist_ok=True)
-    cfg_path = os.path.join(out_dir, "astro_config.json")
+    safe_name = _sanitize_filename_component(cfg_name)
+    cfg_filename = f"astro_config_{safe_name}.json" if safe_name else "astro_config.json"
+    cfg_path = os.path.join(out_dir, cfg_filename)
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(p, f, indent=4, ensure_ascii=False)
     return f"✅ 參數已成功匯出至：`{cfg_path}`", cfg_path
@@ -1310,7 +1546,10 @@ def import_config_fn(file_obj):
         path = file_obj if isinstance(file_obj, str) else file_obj.name
         with open(path, "r", encoding="utf-8") as f:
             p = json.load(f)
-        
+        # 相容具名快照檔（{"params": {...}, "snapshot_name": ...}）與舊版純參數字典兩種格式
+        if isinstance(p, dict) and "params" in p and isinstance(p["params"], dict):
+            p = p["params"]
+
         updates = []
         for name in PARAM_NAMES:
             if name in p:
@@ -1323,6 +1562,82 @@ def import_config_fn(file_obj):
 
 
 # ============================================================
+# ==================== 快照存成檔案 / 從檔案載入快照 ================
+# ============================================================
+# 沿用上面 export_config_fn / import_config_fn 的 JSON 讀寫邏輯，
+# 差別在於：這裡操作的對象是「已經存在 A/B/C 某一格裡的快照」（gr.State 裡的參數字典），
+# 而不是目前滑桿上的即時參數；多包一層 snapshot_name/slot 中繼資料，
+# 方便之後載入時能顯示這是哪一組、叫什麼名字。
+
+def export_snapshot_to_file_fn(slot_label, snap_name, snap_a, snap_b, snap_c, lang):
+    snapshot_map = {"A": snap_a, "B": snap_b, "C": snap_c}
+    snapshot = snapshot_map.get(slot_label)
+    if snapshot is None:
+        msg = (f"⚠️ 快照 {slot_label} 是空的，請先按「儲存為 {slot_label}」" if lang == "zh"
+               else f"⚠️ Snapshot {slot_label} is empty — save it first")
+        return msg, None
+
+    out_dir = _default_output_base()
+    os.makedirs(out_dir, exist_ok=True)
+    safe_name = _sanitize_filename_component(snap_name)
+    file_stub = safe_name or f"slot_{slot_label}"
+    path = os.path.join(out_dir, f"astro_snapshot_{file_stub}.json")
+
+    import datetime
+    payload = {
+        "snapshot_name": snap_name or "",
+        "slot": slot_label,
+        "saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "params": snapshot,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=4, ensure_ascii=False)
+
+    label = snap_name or slot_label
+    msg = (f"✅ 快照「{label}」已存成檔案：`{path}`" if lang == "zh"
+           else f"✅ Snapshot \"{label}\" saved to file: `{path}`")
+    return msg, path
+
+
+def import_snapshot_from_file_fn(file_obj, slot_label, lang):
+    # 三個 slot 的 state / status 預設都不變動，只更新使用者選擇的目標 slot
+    state_updates = [gr.update(), gr.update(), gr.update()]
+    status_updates = [gr.update(), gr.update(), gr.update()]
+    idx = {"A": 0, "B": 1, "C": 2}.get(slot_label, 0)
+
+    if file_obj is None:
+        msg = "⚠️ 請選擇要載入的快照 JSON 檔案" if lang == "zh" else "⚠️ Please select a snapshot JSON file"
+        return (*state_updates, *status_updates, msg, gr.update())
+
+    try:
+        path = file_obj if isinstance(file_obj, str) else file_obj.name
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        # 相容「具名快照檔」與單純的參數 JSON（例如直接拿 astro_config.json 當快照用）
+        if isinstance(payload, dict) and "params" in payload and isinstance(payload["params"], dict):
+            params = payload["params"]
+            snap_name = payload.get("snapshot_name", "")
+        else:
+            params = payload
+            snap_name = ""
+
+        # 只保留這個版本本來就認識的參數欄位，未知/缺漏的欄位交給現有滑桿值
+        filtered = {name: params[name] for name in PARAM_NAMES if name in params}
+
+        state_updates[idx] = filtered
+        label = snap_name or slot_label
+        status_updates[idx] = (f"✅ 快照「{label}」已從檔案載入到 {slot_label}（尚未套用到滑桿，請按「套用 {slot_label}」）"
+                                if lang == "zh" else
+                                f"✅ Snapshot \"{label}\" loaded into slot {slot_label} from file (not yet applied — click \"Apply {slot_label}\")")
+        msg = status_updates[idx]
+        name_update = gr.update(value=snap_name) if snap_name else gr.update()
+        return (*state_updates, *status_updates, msg, name_update)
+    except Exception as e:
+        err_msg = f"❌ 快照載入失敗: {e}" if lang == "zh" else f"❌ Failed to load snapshot: {e}"
+        return (*state_updates, *status_updates, err_msg, gr.update())
+
+
+
 # ========================= Gradio 介面 =========================
 # ============================================================
 
@@ -1488,6 +1803,7 @@ def export_fn(full_img, out_dir, out_name, want_layers, lang, *param_values):
     if not out_name:
         out_name = "processed"
     p = collect_params(param_values)
+    t0 = time.perf_counter()
     try:
         os.makedirs(out_dir, exist_ok=True)
         # 全解析度匯出：preview_scale=1.0，星點縮小/去星參數直接採用使用者設定的原始數值
@@ -1501,10 +1817,15 @@ def export_fn(full_img, out_dir, out_name, want_layers, lang, *param_values):
             files.append(mask_path)
             sl_jpg, sl_tif = save_image_files(result['starless'], out_dir, f"{out_name}_starless")
             files += [sl_jpg, sl_tif]
-        msg = f"✅ 匯出完成，共 {len(files)} 個檔案 → `{out_dir}`" if lang == "zh" else f"✅ Export completed, {len(files)} files → `{out_dir}`"
+        elapsed = time.perf_counter() - t0
+        msg = (f"✅ 匯出完成，共 {len(files)} 個檔案，總耗時 {elapsed:.2f}s → `{out_dir}`"
+               if lang == "zh" else
+               f"✅ Export completed, {len(files)} files, total {elapsed:.2f}s → `{out_dir}`")
         return msg, files
     except Exception as e:
-        err_msg = f"❌ 匯出失敗: {e}" if lang == "zh" else f"❌ Export failed: {e}"
+        elapsed = time.perf_counter() - t0
+        err_msg = (f"❌ 匯出失敗（耗時 {elapsed:.2f}s）: {e}" if lang == "zh"
+                   else f"❌ Export failed (after {elapsed:.2f}s): {e}")
         return err_msg, None
 
 
@@ -1543,8 +1864,10 @@ def batch_process_fn(folder, out_dir, want_layers, lang, *param_values):
                f"🚀 Batch started, {total} image(s) → output to `{out_dir}`")
     yield header
 
+    batch_t0 = time.perf_counter()
     for i, fname in enumerate(files, 1):
         base_name = os.path.splitext(fname)[0]
+        file_t0 = time.perf_counter()
         try:
             img = load_image_any(os.path.join(folder, fname))
             result = run_pipeline(img, p, want_layers=want_layers, preview_scale=1.0)
@@ -1552,27 +1875,40 @@ def batch_process_fn(folder, out_dir, want_layers, lang, *param_values):
             if want_layers and 'mask' in result:
                 cv2.imwrite(os.path.join(out_dir, f"{base_name}_starmask.png"), result['mask'])
                 save_image_files(result['starless'], out_dir, f"{base_name}_starless")
+            file_elapsed = time.perf_counter() - file_t0
             done += 1
-            log_lines.append(f"✅ [{i}/{total}] {fname}")
+            log_lines.append(f"✅ [{i}/{total}] {fname}（{file_elapsed:.2f}s）" if lang == "zh"
+                              else f"✅ [{i}/{total}] {fname} ({file_elapsed:.2f}s)")
         except Exception as e:
+            file_elapsed = time.perf_counter() - file_t0
             failed.append(fname)
-            log_lines.append(f"❌ [{i}/{total}] {fname}: {e}")
+            log_lines.append(f"❌ [{i}/{total}] {fname}（{file_elapsed:.2f}s）: {e}" if lang == "zh"
+                              else f"❌ [{i}/{total}] {fname} ({file_elapsed:.2f}s): {e}")
+
+        # 依目前已處理張數的平均耗時，推估剩餘時間，方便使用者判斷還要等多久
+        elapsed_so_far = time.perf_counter() - batch_t0
+        avg_per_file = elapsed_so_far / i
+        remaining = max(0.0, avg_per_file * (total - i))
+        eta_line = (f"⏱️ 已耗時 {elapsed_so_far:.1f}s，預估剩餘 {remaining:.1f}s（平均每張 {avg_per_file:.2f}s）"
+                    if lang == "zh" else
+                    f"⏱️ Elapsed {elapsed_so_far:.1f}s, estimated {remaining:.1f}s remaining (avg {avg_per_file:.2f}s/file)")
 
         progress_tail = "\n".join(log_lines[-8:])  # 只顯示最近 8 行，避免訊息無限增長
-        status = (f"{header}\n\n⏳ 進度: {i}/{total}（成功 {done}，失敗 {len(failed)}）\n\n{progress_tail}"
+        status = (f"{header}\n\n⏳ 進度: {i}/{total}（成功 {done}，失敗 {len(failed)}）\n{eta_line}\n\n{progress_tail}"
                    if lang == "zh" else
-                   f"{header}\n\n⏳ Progress: {i}/{total} (success {done}, failed {len(failed)})\n\n{progress_tail}")
+                   f"{header}\n\n⏳ Progress: {i}/{total} (success {done}, failed {len(failed)})\n{eta_line}\n\n{progress_tail}")
         yield status
 
+    total_elapsed = time.perf_counter() - batch_t0
     if failed:
         fail_list = "、".join(failed) if lang == "zh" else ", ".join(failed)
-        summary = (f"🏁 批次處理完成：成功 {done} 張，失敗 {len(failed)} 張 → `{out_dir}`\n\n失敗檔案：{fail_list}"
+        summary = (f"🏁 批次處理完成：成功 {done} 張，失敗 {len(failed)} 張，總耗時 {total_elapsed:.1f}s → `{out_dir}`\n\n失敗檔案：{fail_list}"
                     if lang == "zh" else
-                    f"🏁 Batch finished: {done} succeeded, {len(failed)} failed → `{out_dir}`\n\nFailed files: {fail_list}")
+                    f"🏁 Batch finished: {done} succeeded, {len(failed)} failed, total {total_elapsed:.1f}s → `{out_dir}`\n\nFailed files: {fail_list}")
     else:
-        summary = (f"🏁 批次處理完成，全部 {done} 張圖片皆已成功匯出 → `{out_dir}`"
+        summary = (f"🏁 批次處理完成，全部 {done} 張圖片皆已成功匯出，總耗時 {total_elapsed:.1f}s → `{out_dir}`"
                     if lang == "zh" else
-                    f"🏁 Batch finished, all {done} image(s) exported successfully → `{out_dir}`")
+                    f"🏁 Batch finished, all {done} image(s) exported successfully, total {total_elapsed:.1f}s → `{out_dir}`")
     yield summary
 
 
@@ -1686,6 +2022,47 @@ UI_TRANSLATIONS = {
         "zh": ("偵測靈敏度", "越高，越多區域會被判定為『目標』而套用加強"),
         "en": ("Detection Sensitivity", "Higher = more area gets classified as 'target' and boosted"),
     },
+    "manual_target_hint_md": {
+        "zh": ("**手動框選加強區域**：自動偵測有時會漏掉較弱的目標、或誤判雜訊區。"
+               "啟用後可框選一塊區域（矩形或橢圓/圓形），不論自動偵測結果如何，該區域一律套用上面的局部拉伸強度加強。"
+               "框選區域會和自動遮罩取聯集，可在右側自動局部拉伸遮罩預覽圖中確認實際涵蓋範圍。"),
+        "en": ("**Manual Boost Region**: Auto-detection can miss a faint target or misjudge a noisy patch. "
+               "Enable this to select a region (rectangle or ellipse/circle) that's always boosted with the strength above, "
+               "regardless of auto-detection. The region is merged with the auto mask (union), and you can "
+               "confirm the actual coverage in the Auto Localized Stretch mask preview on the right."),
+    },
+    "manual_target_enable": {
+        "zh": ("啟用手動框選區域", "即使自動局部拉伸沒有偵測到任何區域，仍可只用手動框選的區域加強"),
+        "en": ("Enable Manual Boost Region", "Works even if Auto Localized Stretch detects nothing — the manual region can boost on its own"),
+    },
+    "manual_target_shape": {
+        "zh": ("框選形狀", "矩形，或橢圓/正圓（寬高百分比相等時即為正圓）"),
+        "en": ("Region Shape", "Rectangle, or ellipse/circle (set width % = height % for a perfect circle)"),
+    },
+    "manual_target_x_pct": {
+        "zh": ("X 中心位置 (%)", "框選區域中心點的水平位置，以整張圖寬度的百分比表示"),
+        "en": ("X Center (%)", "Horizontal position of the region's center, as a percentage of image width"),
+    },
+    "manual_target_y_pct": {
+        "zh": ("Y 中心位置 (%)", "框選區域中心點的垂直位置，以整張圖高度的百分比表示"),
+        "en": ("Y Center (%)", "Vertical position of the region's center, as a percentage of image height"),
+    },
+    "manual_target_w_pct": {
+        "zh": ("框選寬度 (%)", "框選區域的寬度，以整張圖寬度的百分比表示"),
+        "en": ("Region Width (%)", "Width of the boost region, as a percentage of image width"),
+    },
+    "manual_target_h_pct": {
+        "zh": ("框選高度 (%)", "框選區域的高度，以整張圖高度的百分比表示"),
+        "en": ("Region Height (%)", "Height of the boost region, as a percentage of image height"),
+    },
+    "manual_target_weight": {
+        "zh": ("框選區域加強權重", "框選範圍內的遮罩值，1.0=與自動偵測最強處等級的加強"),
+        "en": ("Region Boost Weight", "Mask value inside the region; 1.0 = as strong as the auto-detected mask's maximum"),
+    },
+    "manual_target_feather_pct": {
+        "zh": ("邊緣羽化 (%)", "羽化程度佔框選區域短邊的百分比，越高邊界越柔和自然，0=硬邊"),
+        "en": ("Edge Feather (%)", "Feather amount as a percentage of the region's shorter side; higher = softer edge, 0 = hard edge"),
+    },
     "sat_boost": {
         "zh": ("飽和度倍率", "銀河/星雲通常需 1.2-1.8 倍增益"),
         "en": ("Saturation Boost Factor", "Milky Way/nebula shots typically need a 1.2-1.8x boost"),
@@ -1718,8 +2095,23 @@ UI_TRANSLATIONS = {
     },
     "denoise_enable": {"zh": "啟用降噪", "en": "Enable Denoise"},
     "denoise_mode": {
-        "zh": ("降噪模式", "fast=雙邊濾波(快); quality=Non-local Means(較乾淨但慢很多，適合最終匯出)"),
-        "en": ("Denoise Mode", "fast = Bilateral Filter (quick); quality = Non-local Means (cleaner but much slower, best for final export)"),
+        "zh": ("降噪模式", "fast=雙邊濾波(快); quality=Non-local Means(較乾淨但慢很多，適合最終匯出); external=呼叫外部 ML 降噪工具(見下方設定)"),
+        "en": ("Denoise Mode", "fast = Bilateral Filter (quick); quality = Non-local Means (cleaner but much slower, best for final export); external = calls an external ML denoiser (see settings below)"),
+    },
+    "denoise_ext_path": {
+        "zh": ("[external]外部降噪工具執行檔路徑",
+               "呼叫使用者電腦上『自行安裝、自行取得授權』的外部降噪工具(如 NoiseXTerminator / DeepSNR CLI)；"
+               "本程式不內建、不重新散布任何第三方模型，授權責任由使用者自行負責。找不到執行檔或呼叫失敗時，"
+               "本步驟會自動跳過並回傳未降噪的原圖，不會中斷處理。"),
+        "en": ("[external] External Denoise Tool Path",
+               "Calls an external denoising tool that the user has installed and licensed themselves "
+               "(e.g. NoiseXTerminator / DeepSNR CLI). This app never bundles or redistributes third-party "
+               "models — licensing responsibility stays with the user. If the executable is missing or the "
+               "call fails, this step is skipped and the unprocessed image is returned; the pipeline is not interrupted."),
+    },
+    "denoise_ext_args": {
+        "zh": ("[external]額外命令列參數", "可用 {input} / {output} 佔位符；留空則預設為「執行檔 輸入檔 輸出檔」"),
+        "en": ("[external] Extra Command-line Arguments", "Use {input} / {output} placeholders; if left blank, defaults to \"executable input_file output_file\""),
     },
     "denoise_d": {
         "zh": ("[fast]濾波視窗", "較大數值降噪範圍廣但耗時"),
@@ -1732,7 +2124,25 @@ UI_TRANSLATIONS = {
         "en": ("[quality] Luminance Denoise Strength (h)", "Higher = cleaner but may erase detail"),
     },
     "denoise_nlm_h_color": {"zh": "[quality]色彩降噪強度 hColor", "en": "[quality] Color Denoise Strength (hColor)"},
-    "star_mode": {"zh": "模式", "en": "Star Processing Mode"},
+    "star_mode": {
+        "zh": ("模式", "external=呼叫外部 ML 去星工具(見下方設定)"),
+        "en": ("Star Processing Mode", "external = calls an external ML star-removal tool (see settings below)"),
+    },
+    "star_ext_path": {
+        "zh": ("[external]外部去星工具執行檔路徑",
+               "呼叫使用者電腦上『自行安裝、自行取得授權』的外部去星工具(如 StarXTerminator / StarNet CLI)；"
+               "本程式不內建、不重新散布任何第三方模型，授權責任由使用者自行負責。找不到執行檔或呼叫失敗時，"
+               "本步驟會自動跳過並回傳未去星的原圖，不會中斷處理。"),
+        "en": ("[external] External Star Removal Tool Path",
+               "Calls an external star-removal tool that the user has installed and licensed themselves "
+               "(e.g. StarXTerminator / StarNet CLI). This app never bundles or redistributes third-party "
+               "models — licensing responsibility stays with the user. If the executable is missing or the "
+               "call fails, this step is skipped and the unprocessed image is returned; the pipeline is not interrupted."),
+    },
+    "star_ext_args": {
+        "zh": ("[external]額外命令列參數", "可用 {input} / {output} 佔位符；留空則預設為「執行檔 輸入檔 輸出檔」"),
+        "en": ("[external] Extra Command-line Arguments", "Use {input} / {output} placeholders; if left blank, defaults to \"executable input_file output_file\""),
+    },
     "star_kernel": {
         "zh": ("偵測核大小(≈星點直徑px)", "應略大於想抓取的中小型星點直徑"),
         "en": ("Star Detection Kernel Size (px)", "Should be slightly larger than the diameter of the small/medium stars you want to detect"),
@@ -1828,16 +2238,22 @@ UI_TRANSLATIONS = {
     "batch_want_layers": {"zh": "每張圖同時輸出星點遮罩 + 去星背景層", "en": "Also export star mask + starless layer for each image"},
     "batch_btn": {"zh": "🚀 開始批次處理整個資料夾", "en": "🚀 Start Batch Processing"},
     "close_btn": {"zh": "✕ 關閉", "en": "✕ Close"},
+    "acc_presets": {"zh": "0️⃣a 🎛️ 新手預設集", "en": "0️⃣a 🎛️ Beginner Presets"},
     "presets_hint_md": {
-        "zh": "**🎛️ 新手預設集**：先選一個接近你拍攝情境的起點，再自行微調。",
-        "en": "**🎛️ Beginner Presets**: Pick a starting point close to your shooting scenario, then fine-tune from there.",
+        "zh": "先選一個接近你拍攝情境的起點，再自行微調。",
+        "en": "Pick a starting point close to your shooting scenario, then fine-tune from there.",
     },
     "preset_milky_way_btn": {"zh": "🌌 銀河模式", "en": "🌌 Milky Way"},
     "preset_nebula_btn": {"zh": "🌫️ 星雲模式", "en": "🌫️ Nebula"},
     "preset_light_pollution_btn": {"zh": "🏙️ 重光害", "en": "🏙️ Heavy Light Pollution"},
+    "cfg_export_name": {
+        "zh": ("匯出檔名（選填）", "例如：後院光害設定（留空則用預設檔名）"),
+        "en": ("Export Filename (optional)", "e.g. 'Backyard Light Pollution' (leave blank to use the default filename)"),
+    },
+    "acc_snapshots": {"zh": "0️⃣b 📌 參數快照", "en": "0️⃣b 📌 Parameter Snapshots"},
     "snapshot_hint_md": {
-        "zh": "**📌 參數快照**：先「儲存」目前這組參數到 A/B/C，之後可以隨時「套用」快速切回比較，不用重新調整滑桿。快照只暫存在這次瀏覽器工作階段中，重新整理頁面會清空。",
-        "en": "**📌 Parameter Snapshots**: 'Save' the current parameter set to slot A/B/C, then 'Apply' any time to switch back instantly for comparison — no need to re-adjust sliders. Snapshots only live in this browser session and are cleared on page refresh.",
+        "zh": "先「儲存」目前這組參數到 A/B/C，之後可以隨時「套用」快速切回比較，不用重新調整滑桿。快照只暫存在這次瀏覽器工作階段中，重新整理頁面會清空。若想長期保留，可在下方為快照命名並「存成檔案」，之後隨時能「從檔案載入」回 A/B/C。",
+        "en": "'Save' the current parameter set to slot A/B/C, then 'Apply' any time to switch back instantly for comparison — no need to re-adjust sliders. Snapshots only live in this browser session and are cleared on page refresh. To keep one long-term, name it below and 'Save to File' — you can 'Load from File' back into A/B/C any time.",
     },
     "snap_a_save_btn": {"zh": "💾 儲存為 A", "en": "💾 Save as A"},
     "snap_a_load_btn": {"zh": "📥 套用 A", "en": "📥 Apply A"},
@@ -1845,7 +2261,20 @@ UI_TRANSLATIONS = {
     "snap_b_load_btn": {"zh": "📥 套用 B", "en": "📥 Apply B"},
     "snap_c_save_btn": {"zh": "💾 儲存為 C", "en": "💾 Save as C"},
     "snap_c_load_btn": {"zh": "📥 套用 C", "en": "📥 Apply C"},
+    "snap_file_hint_md": {
+        "zh": "**💾 快照命名與存檔**：選擇上面 A/B/C 其中一格，取個名字後「存成檔案」，或「從檔案載入」回填到指定的 A/B/C（載入後仍需按「套用」才會實際套用到滑桿）。",
+        "en": "**💾 Named Snapshot Save/Load**: Pick one of the A/B/C slots above, give it a name, and 'Save to File' — or 'Load from File' back into a chosen slot (still needs 'Apply' afterward to actually update the sliders).",
+    },
+    "snap_file_target": {"zh": "目標快照", "en": "Target Slot"},
+    "snap_file_name": {
+        "zh": ("快照名稱（選填）", "例如：後院光害"),
+        "en": ("Snapshot Name (optional)", "e.g. 'Backyard Light Pollution'"),
+    },
+    "snap_save_file_btn": {"zh": "💾 快照存成檔案", "en": "💾 Save Snapshot to File"},
+    "snap_load_file": {"zh": "📂 從檔案載入快照", "en": "📂 Load Snapshot from File"},
+    "snap_file_download": {"zh": "點擊下載已存檔的快照", "en": "Click to download the saved snapshot file"},
 }
+
 
 # 以下是「初次載入畫面時」的預設佔位訊息（尚未做任何操作前顯示）。
 # 因為這些欄位平常會被 load_image_fn / export_config_fn / update_preview_fn 等函式
@@ -2524,6 +2953,9 @@ with gr.Blocks(
                     gr.Markdown("---")
                     with gr.Group():
                         cfg_header_md = gr.Markdown("### 💾 備份與還原參數 (.json)")
+                        cfg_export_name = gr.Textbox(
+                            label="匯出檔名（選填）", placeholder="例如：後院光害設定（留空則用預設檔名）",
+                        )
                         with gr.Row():
                             cfg_export_btn = gr.Button("📤 匯出當前參數", size="sm")
                             cfg_import_file = gr.File(
@@ -2537,8 +2969,8 @@ with gr.Blocks(
                 with gr.Tab("⚙️ 參數調整") as tab_param:
 
                     # ── Presets：給新手的起始參數 ──────────────
-                    with gr.Group(elem_id="presets-group"):
-                        presets_hint_md = gr.Markdown("**🎛️ 新手預設集**：先選一個接近你拍攝情境的起點，再自行微調。")
+                    with gr.Accordion("0️⃣a 🎛️ 新手預設集", open=False, elem_id="presets-group") as acc_presets:
+                        presets_hint_md = gr.Markdown("先選一個接近你拍攝情境的起點，再自行微調。")
                         with gr.Row():
                             preset_milky_way_btn = gr.Button("🌌 銀河模式", size="sm")
                             preset_nebula_btn    = gr.Button("🌫️ 星雲模式", size="sm")
@@ -2546,10 +2978,11 @@ with gr.Blocks(
                         preset_status = gr.Markdown("")
 
                     # ── 參數快照：A / B / C 三組快速比較 ─────────
-                    with gr.Group(elem_id="snapshots-group"):
+                    with gr.Accordion("0️⃣b 📌 參數快照", open=False, elem_id="snapshots-group") as acc_snapshots:
                         snapshot_hint_md = gr.Markdown(
-                            "**📌 參數快照**：先「儲存」目前這組參數到 A/B/C，之後可以隨時「套用」快速切回比較，"
+                            "先「儲存」目前這組參數到 A/B/C，之後可以隨時「套用」快速切回比較，"
                             "不用重新調整滑桿。快照只暫存在這次瀏覽器工作階段中，重新整理頁面會清空。"
+                            "若想長期保留，可在下方為快照命名並「存成檔案」，之後隨時能「從檔案載入」回 A/B/C。"
                         )
                         with gr.Row():
                             with gr.Column(min_width=0):
@@ -2564,6 +2997,20 @@ with gr.Blocks(
                                 snap_c_save_btn = gr.Button("💾 儲存為 C", size="sm")
                                 snap_c_load_btn = gr.Button("📥 套用 C", size="sm")
                                 snap_c_status = gr.Markdown("🔲 快照 C：尚未儲存")
+
+                        gr.Markdown("---")
+                        snap_file_hint_md = gr.Markdown(
+                            "**💾 快照命名與存檔**：選擇上面 A/B/C 其中一格，取個名字後「存成檔案」，"
+                            "或「從檔案載入」回填到指定的 A/B/C（載入後仍需按「套用」才會實際套用到滑桿）。"
+                        )
+                        with gr.Row():
+                            snap_file_target = gr.Radio(["A", "B", "C"], value="A", label="目標快照", min_width=0)
+                            snap_file_name = gr.Textbox(label="快照名稱（選填）", placeholder="例如：後院光害", min_width=0)
+                        with gr.Row():
+                            snap_save_file_btn = gr.Button("💾 快照存成檔案", size="sm")
+                            snap_load_file = gr.File(label="📂 從檔案載入快照", file_count="single", type="filepath")
+                        snap_file_status = gr.Markdown("")
+                        snap_file_download = gr.File(label="點擊下載已存檔的快照")
 
                     with gr.Group():
 
@@ -2590,6 +3037,36 @@ with gr.Blocks(
                             local_target_radius      = gr.Slider(10,  120, value=40,   step=5,    label="偵測/加強半徑(px)", info="約略對應星雲結構的尺度，太小會連星點都吃到")
                             local_target_sensitivity = gr.Slider(0.3, 3,   value=1.0,  step=0.1,  label="偵測靈敏度", info="越高，越多區域會被判定為『目標』而套用加強")
 
+                            gr.Markdown("---")
+                            manual_target_hint_md = gr.Markdown(
+                                "**手動框選加強區域**：自動偵測有時會漏掉較弱的目標、或誤判雜訊區。"
+                                "啟用後可框選一塊區域（矩形或橢圓/圓形），不論自動偵測結果如何，該區域一律套用上面的局部拉伸強度加強。"
+                                "框選區域會和自動遮罩取聯集，可在右側自動局部拉伸遮罩預覽圖中確認實際涵蓋範圍。"
+                            )
+                            manual_target_enable = gr.Checkbox(
+                                label="啟用手動框選區域", value=DEFAULTS[53],
+                                info="即使自動局部拉伸沒有偵測到任何區域，仍可只用手動框選的區域加強"
+                            )
+                            manual_target_shape = gr.Radio(
+                                ["rectangle", "ellipse"], value="rectangle",
+                                label="框選形狀", info="矩形，或橢圓/正圓（寬高百分比相等時即為正圓）"
+                            )
+                            with gr.Row():
+                                manual_target_x_pct = gr.Slider(0, 100, value=50, step=0.5,
+                                                                 label="X 中心位置 (%)", info="框選區域中心點的水平位置，以整張圖寬度的百分比表示")
+                                manual_target_y_pct = gr.Slider(0, 100, value=50, step=0.5,
+                                                                 label="Y 中心位置 (%)", info="框選區域中心點的垂直位置，以整張圖高度的百分比表示")
+                            with gr.Row():
+                                manual_target_w_pct = gr.Slider(2, 100, value=25, step=0.5,
+                                                                 label="框選寬度 (%)", info="框選區域的寬度，以整張圖寬度的百分比表示")
+                                manual_target_h_pct = gr.Slider(2, 100, value=25, step=0.5,
+                                                                 label="框選高度 (%)", info="框選區域的高度，以整張圖高度的百分比表示")
+                            with gr.Row():
+                                manual_target_weight = gr.Slider(0, 1, value=1.0, step=0.05,
+                                                                  label="框選區域加強權重", info="框選範圍內的遮罩值，1.0=與自動偵測最強處等級的加強")
+                                manual_target_feather_pct = gr.Slider(0, 50, value=20, step=1,
+                                                                       label="邊緣羽化 (%)", info="羽化程度佔框選區域短邊的百分比，越高邊界越柔和自然，0=硬邊")
+
                         with gr.Accordion("4️⃣ 飽和度 / 明度 / RGB通道", open=True) as acc_sat:
                             sat_boost    = gr.Slider(0.5, 3,   value=1.45, step=0.05, label="飽和度倍率", info="銀河/星雲通常需 1.2-1.8 倍增益")
                             bright_boost = gr.Slider(0.5, 2,   value=1.03, step=0.01, label="明度倍率", info="整體亮度微調，通常接近 1.0 即可，避免過曝")
@@ -2605,15 +3082,27 @@ with gr.Blocks(
 
                         with gr.Accordion("6️⃣ 降噪", open=False) as acc_denoise:
                             denoise_enable      = gr.Checkbox(label="啟用降噪", value=DEFAULTS[24])
-                            denoise_mode        = gr.Radio(["fast", "quality"], value="fast", label="降噪模式", info="fast=雙邊濾波(快); quality=Non-local Means(較乾淨但慢很多，適合最終匯出)")
+                            denoise_mode        = gr.Radio(["fast", "quality", "external"], value="fast", label="降噪模式", info="fast=雙邊濾波(快); quality=Non-local Means(較乾淨但慢很多，適合最終匯出); external=呼叫外部 ML 降噪工具(見下方設定)")
                             denoise_d           = gr.Slider(1, 15, value=5,  step=1, label="[fast]濾波視窗", info="較大數值降噪範圍廣但耗時")
                             denoise_sigma_color = gr.Slider(1, 50, value=15, step=1, label="[fast]顏色 Sigma", info="越高越能融合差異較大的顏色，但可能糊掉色彩邊界")
                             denoise_sigma_space = gr.Slider(1, 50, value=15, step=1, label="[fast]空間 Sigma", info="越高影響範圍越大的鄰近像素，降噪更平滑但更慢")
                             denoise_nlm_h       = gr.Slider(1, 30, value=10, step=1, label="[quality]亮度降噪強度 h", info="越高越乾淨，但可能抹掉細節")
                             denoise_nlm_h_color = gr.Slider(1, 30, value=10, step=1, label="[quality]色彩降噪強度 hColor", info="越高色彩雜訊越乾淨，但可能造成色塊化")
+                            denoise_ext_path    = gr.Textbox(
+                                label="[external]外部降噪工具執行檔路徑", value="",
+                                placeholder="例如：C:\\Tools\\NoiseXTerminator\\nxt_cli.exe",
+                                info="呼叫使用者電腦上『自行安裝、自行取得授權』的外部降噪工具(如 NoiseXTerminator / DeepSNR CLI)；"
+                                     "本程式不內建、不重新散布任何第三方模型，授權責任由使用者自行負責。找不到執行檔或呼叫失敗時，"
+                                     "本步驟會自動跳過並回傳未降噪的原圖，不會中斷處理。",
+                            )
+                            denoise_ext_args    = gr.Textbox(
+                                label="[external]額外命令列參數", value="",
+                                placeholder="可用 {input} / {output} 佔位符；留空則預設為「執行檔 輸入檔 輸出檔」",
+                                info="若外部工具的命令列語法不是單純的「輸入檔 輸出檔」，可在此用 {input}/{output} 自訂順序與其他參數。",
+                            )
 
                         with gr.Accordion("7️⃣ 星點縮小 / 去星", open=False) as acc_star:
-                            star_mode           = gr.Radio(["none","shrink","remove"], value="shrink", label="模式")
+                            star_mode           = gr.Radio(["none","shrink","remove","external"], value="shrink", label="模式", info="external=呼叫外部 ML 去星工具(見下方設定)")
                             star_kernel         = gr.Slider(3,  15,   value=5,    step=1,    label="偵測核大小(≈星點直徑px)", info="應略大於想抓取的中小型星點直徑")
                             star_thresh         = gr.Slider(1,  60,   value=18,   step=1,    label="偵測門檻", info="越低暗星越多，過低會誤抓背景熱雜訊")
                             star_max_area       = gr.Slider(20, 1000, value=250,  step=10,   label="星點最大面積", info="超過此面積的斑塊不視為一般星點，避免誤抓星雲亮核")
@@ -2627,6 +3116,18 @@ with gr.Blocks(
                             star_inpaint_radius = gr.Slider(1,  20,   value=5,    step=1,    label="[去星]單星取樣半徑", info="從星點周圍多遠的範圍取樣來填補去星後的背景")
                             star_feather_px     = gr.Slider(0,  8,    value=2.0,  step=0.25, label="[去星]邊緣羽化程度", info="去星邊界的柔化寬度，越高過渡越自然但越模糊")
                             star_noise_strength = gr.Slider(0,  2,    value=1.0,  step=0.05, label="[去星]雜訊回填強度", info="0 為不回填")
+                            star_ext_path       = gr.Textbox(
+                                label="[external]外部去星工具執行檔路徑", value="",
+                                placeholder="例如：C:\\Tools\\StarXTerminator\\sxt_cli.exe",
+                                info="呼叫使用者電腦上『自行安裝、自行取得授權』的外部去星工具(如 StarXTerminator / StarNet CLI)；"
+                                     "本程式不內建、不重新散布任何第三方模型，授權責任由使用者自行負責。找不到執行檔或呼叫失敗時，"
+                                     "本步驟會自動跳過並回傳未去星的原圖，不會中斷處理。",
+                            )
+                            star_ext_args       = gr.Textbox(
+                                label="[external]額外命令列參數", value="",
+                                placeholder="可用 {input} / {output} 佔位符；留空則預設為「執行檔 輸入檔 輸出檔」",
+                                info="若外部工具的命令列語法不是單純的「輸入檔 輸出檔」，可在此用 {input}/{output} 自訂順序與其他參數。",
+                            )
 
                         with gr.Accordion("7️⃣b 大範圍偵測(密集星團/大片暈光)", open=False) as acc_cluster:
                             multiscale_enable      = gr.Checkbox(label="啟用大範圍偵測", value=DEFAULTS[43])
@@ -2777,6 +3278,11 @@ with gr.Blocks(
         multiscale_enable, cluster_kernel, cluster_thresh, cluster_min_area, cluster_max_area,
         cluster_aspect, cluster_dilate, cluster_inpaint_radius,
         star_feather_px, star_noise_strength,
+        manual_target_enable, manual_target_x_pct, manual_target_y_pct,
+        manual_target_w_pct, manual_target_h_pct, manual_target_weight, manual_target_feather_pct,
+        manual_target_shape,
+        denoise_ext_path, denoise_ext_args,
+        star_ext_path, star_ext_args,
     ]
 
     sliders_for_release = [
@@ -2793,8 +3299,10 @@ with gr.Blocks(
         cluster_kernel, cluster_thresh, cluster_min_area, cluster_max_area,
         cluster_aspect, cluster_dilate, cluster_inpaint_radius,
         star_feather_px, star_noise_strength,
+        manual_target_x_pct, manual_target_y_pct, manual_target_w_pct, manual_target_h_pct,
+        manual_target_weight, manual_target_feather_pct,
     ]
-    toggles_for_change = [bg_enable, wb_enable, local_target_enable, denoise_enable, denoise_mode, star_mode, multiscale_enable]
+    toggles_for_change = [bg_enable, wb_enable, local_target_enable, manual_target_enable, manual_target_shape, denoise_enable, denoise_mode, star_mode, multiscale_enable]
 
     # Preview common inputs / outputs
     _PREV_IN  = [state_preview_base, state_preview_scale, state_full,
@@ -2829,6 +3337,15 @@ with gr.Blocks(
         (local_target_strength, "local_target_strength"),
         (local_target_radius, "local_target_radius"),
         (local_target_sensitivity, "local_target_sensitivity"),
+        (manual_target_hint_md, "manual_target_hint_md"),
+        (manual_target_enable, "manual_target_enable"),
+        (manual_target_shape, "manual_target_shape"),
+        (manual_target_x_pct, "manual_target_x_pct"),
+        (manual_target_y_pct, "manual_target_y_pct"),
+        (manual_target_w_pct, "manual_target_w_pct"),
+        (manual_target_h_pct, "manual_target_h_pct"),
+        (manual_target_weight, "manual_target_weight"),
+        (manual_target_feather_pct, "manual_target_feather_pct"),
         (sat_boost, "sat_boost"),
         (bright_boost, "bright_boost"),
         (r_gain, "r_gain"),
@@ -2845,6 +3362,8 @@ with gr.Blocks(
         (denoise_sigma_space, "denoise_sigma_space"),
         (denoise_nlm_h, "denoise_nlm_h"),
         (denoise_nlm_h_color, "denoise_nlm_h_color"),
+        (denoise_ext_path, "denoise_ext_path"),
+        (denoise_ext_args, "denoise_ext_args"),
         (star_mode, "star_mode"),
         (star_kernel, "star_kernel"),
         (star_thresh, "star_thresh"),
@@ -2859,6 +3378,8 @@ with gr.Blocks(
         (star_inpaint_radius, "star_inpaint_radius"),
         (star_feather_px, "star_feather_px"),
         (star_noise_strength, "star_noise_strength"),
+        (star_ext_path, "star_ext_path"),
+        (star_ext_args, "star_ext_args"),
         (multiscale_enable, "multiscale_enable"),
         (cluster_kernel, "cluster_kernel"),
         (cluster_thresh, "cluster_thresh"),
@@ -2918,16 +3439,25 @@ with gr.Blocks(
         (batch_btn, "batch_btn"),
         (close_btn, "close_btn"),
         (presets_hint_md, "presets_hint_md"),
+        (acc_presets, "acc_presets"),
         (preset_milky_way_btn, "preset_milky_way_btn"),
         (preset_nebula_btn, "preset_nebula_btn"),
         (preset_light_pollution_btn, "preset_light_pollution_btn"),
         (snapshot_hint_md, "snapshot_hint_md"),
+        (acc_snapshots, "acc_snapshots"),
         (snap_a_save_btn, "snap_a_save_btn"),
         (snap_a_load_btn, "snap_a_load_btn"),
         (snap_b_save_btn, "snap_b_save_btn"),
         (snap_b_load_btn, "snap_b_load_btn"),
         (snap_c_save_btn, "snap_c_save_btn"),
         (snap_c_load_btn, "snap_c_load_btn"),
+        (cfg_export_name, "cfg_export_name"),
+        (snap_file_hint_md, "snap_file_hint_md"),
+        (snap_file_target, "snap_file_target"),
+        (snap_file_name, "snap_file_name"),
+        (snap_save_file_btn, "snap_save_file_btn"),
+        (snap_load_file, "snap_load_file"),
+        (snap_file_download, "snap_file_download"),
     ]
 
     def make_change_lang(lang):
@@ -2951,10 +3481,11 @@ with gr.Blocks(
                              "local_preview_btn", "batch_btn", "close_btn",
                              "preset_milky_way_btn", "preset_nebula_btn", "preset_light_pollution_btn",
                              "snap_a_save_btn", "snap_a_load_btn", "snap_b_save_btn", "snap_b_load_btn",
-                             "snap_c_save_btn", "snap_c_load_btn"]:
+                             "snap_c_save_btn", "snap_c_load_btn", "snap_save_file_btn"]:
                     updates.append(gr.update(value=label_txt))
                 elif key in ["cfg_header_md", "layer_hint_md", "local_hint_md", "batch_hint_md",
-                             "presets_hint_md", "snapshot_hint_md"]:
+                             "presets_hint_md", "snapshot_hint_md", "snap_file_hint_md",
+                             "manual_target_hint_md"]:
                     updates.append(gr.update(value=label_txt))
                 elif key == "compare_mode":
                     choices_zh = ["並排顯示", "滑桿疊圖"]
@@ -3158,7 +3689,7 @@ with gr.Blocks(
     # ── Config export / import ────────────────────────────────
     cfg_export_btn.click(
         fn=export_config_fn,
-        inputs=PARAM_COMPONENTS,
+        inputs=[cfg_export_name] + PARAM_COMPONENTS,
         outputs=[cfg_status, cfg_download],
     )
 
@@ -3168,6 +3699,21 @@ with gr.Blocks(
         outputs=[cfg_status] + PARAM_COMPONENTS,
     ).then(
         fn=update_preview_fn, inputs=_PREV_IN, outputs=_PREV_OUT,
+    )
+
+    # ── Named snapshot save-to-file / load-from-file ──────────
+    snap_save_file_btn.click(
+        fn=export_snapshot_to_file_fn,
+        inputs=[snap_file_target, snap_file_name, state_snap_a, state_snap_b, state_snap_c, state_lang],
+        outputs=[snap_file_status, snap_file_download],
+    )
+
+    snap_load_file.change(
+        fn=import_snapshot_from_file_fn,
+        inputs=[snap_load_file, snap_file_target, state_lang],
+        outputs=[state_snap_a, state_snap_b, state_snap_c,
+                 snap_a_status, snap_b_status, snap_c_status,
+                 snap_file_status, snap_file_name],
     )
 
     # ── System monitor refresh ────────────────────────────────
