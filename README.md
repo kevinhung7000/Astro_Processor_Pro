@@ -10,6 +10,8 @@
 
 No Python required — grab the ready-to-use installer from the **[Releases](../../releases)** page and run `AstroProcessorPro_Setup.exe` (~250 MB, CPU + DirectML build). See [Build a Standalone Windows .exe](#️-build-a-standalone-windows-exe-optional) below if you'd rather build it yourself or need a CUDA-enabled build.
 
+> By default, the app saves exported images and config backups to `Documents\AstroProcessorPro\outputs` (writable by any user, regardless of where the app itself is installed). You can change this in the "Output Directory" field before exporting.
+
 ---
 
 An interactive, high-performance astro-imaging post-processing application built on Gradio. This tool specializes in wide-field astrophotography and Milky Way stack post-processing.
@@ -125,6 +127,8 @@ An [Inno Setup](https://jrsoftware.org/isdl.php) script (`AstroProcessorPro_Setu
 ### 📥 下載（Windows）
 
 不需要安裝 Python — 直接到 **[Releases](../../releases)** 頁面下載 `AstroProcessorPro_Setup.exe`（約 250 MB，CPU + DirectML 版本），雙擊安裝即可使用。若想自行打包或需要 CUDA 版本，請參考下方的[打包成獨立 Windows .exe](#️-打包成獨立-windows-exe選用)章節。
+
+> 預設情況下，匯出的圖片與參數備份會存到 `文件\AstroProcessorPro\outputs`（不論程式安裝在哪裡，這個位置都保證可寫入）。若要改存到別的地方，可以在匯出前直接修改「輸出資料夾」欄位。
 
 ---
 
