@@ -27,6 +27,10 @@ An interactive, high-performance astro-imaging post-processing application built
 - **⭐ Star Reduction & Multi-scale Removal**:
   - **Star Shrink**: Erode stars using structuring elements.
   - **Star Removal**: Detects stars and larger halo/cluster regions based on size and shape, uses randomized noise backfills to match surrounding grains, and performs feathered inpainting.
+- **🧹 Denoising**: "Fast" mode (bilateral filter) for responsive live preview, or "Quality" mode (Non-local Means) for a cleaner final export — each with its own strength controls.
+- **🎯 Auto Localized Stretch**: Automatically detects textured regions (nebulosity, galaxy structure) via local-contrast analysis and boosts contrast only there, leaving the flat sky background untouched. A mask preview shows exactly what got detected and how strongly.
+- **🎨 Presets & Snapshots**: One-click "Milky Way" / "Nebula" / "Heavy Light Pollution" starting points for beginners, plus Snapshot A/B/C slots to save and instantly switch between candidate parameter sets during a session.
+- **📁 Batch Processing**: Apply the current parameter set to every image in a folder in one go, with per-file progress and a success/failure summary.
 - **💾 Full-Resolution Export**: Outputs high-quality JPEG and 16-bit TIFF files, with option to save independent Star Mask and Starless layers.
 - **⚙️ Config Backup & Restore**: Export and import your parameters as `.json` files.
 - **🖥️ Live System Monitor**: Keep track of CPU, RAM, and GPU VRAM usage right from the UI.
@@ -140,6 +144,10 @@ An [Inno Setup](https://jrsoftware.org/isdl.php) script (`AstroProcessorPro_Setu
 - **⭐ 星點縮小與多尺度去星**：
   - **星點縮小 (Star Shrink)**：透過形態學侵蝕技術等比例收縮星點。
   - **多尺度去星 (Star Removal)**：依大小與形狀偵測星點與較大範圍的暈光/星團區域，使用羽化遮罩與背景雜訊顆粒回填進行 Inpaint 修補，讓效果更貼近原始星空的顆粒感。
+- **🧹 降噪**："fast"（雙邊濾波）模式讓即時預覽保持流暢，"quality"（Non-local Means）模式則在最終匯出時提供更乾淨的結果，兩者各有獨立的強度控制。
+- **🎯 自動局部拉伸**：透過局部對比分析自動偵測有結構的區域（星雲、銀河塵埃帶等），只加強該處對比，天空背景幾乎不受影響。內建遮罩預覽圖，可實際看到偵測到哪裡、加強力道多少。
+- **🎨 預設集與快照**：一鍵套用「銀河模式」「星雲模式」「重光害」等新手起手式，並提供快照 A/B/C 插槽，可在同一次工作階段中儲存並即時切換候選參數組合。
+- **📁 批次處理**：一次將目前參數套用到整個資料夾內的所有圖片，逐張顯示進度並於結束後給出成功/失敗摘要。
 - **💾 高解析度匯出**：一鍵匯出高品質 JPEG 與 16-bit 無損 TIFF。可選額外輸出「星點遮罩」與「去星背景圖層」供後續手動疊圖。
 - **⚙️ 參數備份與還原**：支援將當前調圖參數匯出為 `.json` 檔案備份，並能隨時載入復原。
 - **🖥️ 實時系統監控**：介面內建 CPU、記憶體與 GPU 顯存 (VRAM) 使用率監控。
