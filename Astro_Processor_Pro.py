@@ -257,6 +257,28 @@ RAW_EXTS = ('.cr2', '.cr3', '.nef', '.arw', '.dng', '.raf', '.orf', '.rw2')
 IMG_EXTS = ('.tif', '.tiff', '.jpg', '.jpeg', '.png', '.bmp') + (RAW_EXTS if HAS_RAWPY else ())
 
 # ============================================================
+# ===================== 預設輸出路徑 =====================
+# ============================================================
+
+def _default_output_base():
+    """回傳預設的輸出資料夾路徑。
+
+    以原始碼執行（`python Astro_Processor_Pro.py`）時，沿用專案資料夾底下的
+    相對路徑 `outputs/`，方便開發時查看檔案。
+
+    但打包成 PyInstaller `.exe` 並安裝到類似 `C:\\Program Files\\...` 這種
+    需要系統管理員權限才能寫入的路徑時，若還是用「相對於程式所在資料夾」的
+    `outputs/`，一般使用者權限的行程會在 os.makedirs()/寫檔時直接
+    PermissionError（[WinError 5] 存取被拒）。因此偵測到是 PyInstaller 打包的
+    frozen 執行檔時，改用使用者「文件」資料夾底下固定的子資料夾，一定可寫入，
+    也比較符合「輸出的圖片應該放在使用者文件裡」的直覺。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.expanduser("~"), "Documents", "AstroProcessorPro", "outputs")
+    return os.path.abspath("outputs")
+
+
+# ============================================================
 # ===================== 圖片讀取 / 前處理 =====================
 # ============================================================
 
@@ -1274,11 +1296,12 @@ def load_snapshot_fn(snapshot, slot_label, lang):
 
 def export_config_fn(*param_values):
     p = collect_params(param_values)
-    os.makedirs("outputs", exist_ok=True)
-    cfg_path = os.path.join("outputs", "astro_config.json")
+    out_dir = _default_output_base()
+    os.makedirs(out_dir, exist_ok=True)
+    cfg_path = os.path.join(out_dir, "astro_config.json")
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(p, f, indent=4, ensure_ascii=False)
-    return f"✅ 參數已成功匯出至：`outputs/astro_config.json`", cfg_path
+    return f"✅ 參數已成功匯出至：`{cfg_path}`", cfg_path
 
 def import_config_fn(file_obj):
     if file_obj is None:
@@ -1507,7 +1530,7 @@ def batch_process_fn(folder, out_dir, want_layers, lang, *param_values):
         return
 
     if not out_dir:
-        out_dir = "outputs/batch"
+        out_dir = os.path.join(_default_output_base(), "batch")
     os.makedirs(out_dir, exist_ok=True)
     p = collect_params(param_values)
 
@@ -2661,7 +2684,7 @@ with gr.Blocks(
 
                 # ── Tab: Export ───────────────────────────────
                 with gr.Tab("💾 匯出全解析度") as tab_export:
-                    output_dir  = gr.Textbox(label="輸出資料夾",         value="outputs")
+                    output_dir  = gr.Textbox(label="輸出資料夾",         value=_default_output_base())
                     output_name = gr.Textbox(label="輸出檔名(不含副檔名)", value="processed")
                     save_layers = gr.Checkbox(
                         label="額外輸出星點遮罩 + 去星背景層(可供後續人工疊圖疊加)",
@@ -2680,7 +2703,7 @@ with gr.Blocks(
                         "來源資料夾裡的每一張圖片，逐一以全解析度處理並輸出。\n\n"
                         "⚠️ 建議先用單張圖片調好參數、確認效果滿意後，再執行批次處理。"
                     )
-                    batch_out_dir = gr.Textbox(label="批次輸出資料夾", value="outputs/batch")
+                    batch_out_dir = gr.Textbox(label="批次輸出資料夾", value=os.path.join(_default_output_base(), "batch"))
                     batch_want_layers = gr.Checkbox(
                         label="每張圖同時輸出星點遮罩 + 去星背景層", value=False
                     )
@@ -3302,11 +3325,11 @@ with gr.Blocks(
 
 
 if __name__ == "__main__":
-    allowed_dir = os.path.abspath("outputs")
+    allowed_dir = _default_output_base()
     os.makedirs(allowed_dir, exist_ok=True)
     demo.launch(
         inbrowser=True,
-        allowed_paths=[allowed_dir, "outputs"],
+        allowed_paths=[allowed_dir],
         theme=gr.themes.Base(
             primary_hue=gr.themes.colors.purple,
             neutral_hue=gr.themes.colors.slate,
