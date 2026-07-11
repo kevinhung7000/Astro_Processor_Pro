@@ -29,10 +29,12 @@ An interactive, high-performance astro-imaging post-processing application built
 - **⭐ Star Reduction & Multi-scale Removal**:
   - **Star Shrink**: Erode stars using structuring elements.
   - **Star Removal**: Detects stars and larger halo/cluster regions based on size and shape, uses randomized noise backfills to match surrounding grains, and performs feathered inpainting.
-- **🧹 Denoising**: "Fast" mode (bilateral filter) for responsive live preview, or "Quality" mode (Non-local Means) for a cleaner final export — each with its own strength controls.
-- **🎯 Auto Localized Stretch**: Automatically detects textured regions (nebulosity, galaxy structure) via local-contrast analysis and boosts contrast only there, leaving the flat sky background untouched. A mask preview shows exactly what got detected and how strongly.
-- **🎨 Presets & Snapshots**: One-click "Milky Way" / "Nebula" / "Heavy Light Pollution" starting points for beginners, plus Snapshot A/B/C slots to save and instantly switch between candidate parameter sets during a session.
-- **📁 Batch Processing**: Apply the current parameter set to every image in a folder in one go, with per-file progress and a success/failure summary.
+  - **External**: Optionally hand off to a user-installed ML star-removal tool (e.g. StarNet, RC-Astro StarXTerminator CLI) instead of the built-in shrink/remove algorithms.
+- **🧹 Denoising**: "Fast" mode (bilateral filter) for responsive live preview, "Quality" mode (Non-local Means) for a cleaner final export, or "External" mode to call a user-installed ML denoiser (e.g. DeepSNR, RC-Astro NoiseXTerminator CLI) — each with its own controls.
+- **🎯 Auto Localized Stretch**: Automatically detects textured regions (nebulosity, galaxy structure) via local-contrast analysis and boosts contrast only there, leaving the flat sky background untouched. A mask preview shows exactly what got detected and how strongly. An optional manual region (rectangle or ellipse, with adjustable feathering and boost weight) lets you override or supplement auto-detection for a target it missed.
+- **🎨 Presets & Snapshots**: One-click "Milky Way" / "Nebula" / "Heavy Light Pollution" starting points for beginners, plus named Snapshot A/B/C slots that can be saved to and loaded from files, so a favorite setup survives a page refresh.
+- **📁 Batch Processing**: Apply the current parameter set to every image in a folder in one go, with per-file progress, elapsed time, and a running ETA, plus a success/failure summary.
+- **🔌 External ML Tool Integration**: Denoise and star removal both support an "external" mode that shells out to a command-line tool you've installed and licensed yourself (e.g. DeepSNR, RC-Astro NoiseXTerminator/StarXTerminator CLI) instead of the built-in algorithms — the app never bundles or redistributes any third-party model.
 - **💾 Full-Resolution Export**: Outputs high-quality JPEG and 16-bit TIFF files, with option to save independent Star Mask and Starless layers.
 - **⚙️ Config Backup & Restore**: Export and import your parameters as `.json` files.
 - **🖥️ Live System Monitor**: Keep track of CPU, RAM, and GPU VRAM usage right from the UI.
@@ -148,10 +150,12 @@ An [Inno Setup](https://jrsoftware.org/isdl.php) script (`AstroProcessorPro_Setu
 - **⭐ 星點縮小與多尺度去星**：
   - **星點縮小 (Star Shrink)**：透過形態學侵蝕技術等比例收縮星點。
   - **多尺度去星 (Star Removal)**：依大小與形狀偵測星點與較大範圍的暈光/星團區域，使用羽化遮罩與背景雜訊顆粒回填進行 Inpaint 修補，讓效果更貼近原始星空的顆粒感。
-- **🧹 降噪**："fast"（雙邊濾波）模式讓即時預覽保持流暢，"quality"（Non-local Means）模式則在最終匯出時提供更乾淨的結果，兩者各有獨立的強度控制。
-- **🎯 自動局部拉伸**：透過局部對比分析自動偵測有結構的區域（星雲、銀河塵埃帶等），只加強該處對比，天空背景幾乎不受影響。內建遮罩預覽圖，可實際看到偵測到哪裡、加強力道多少。
-- **🎨 預設集與快照**：一鍵套用「銀河模式」「星雲模式」「重光害」等新手起手式，並提供快照 A/B/C 插槽，可在同一次工作階段中儲存並即時切換候選參數組合。
-- **📁 批次處理**：一次將目前參數套用到整個資料夾內的所有圖片，逐張顯示進度並於結束後給出成功/失敗摘要。
+  - **外部工具 (External)**：可選擇改呼叫使用者自行安裝的 ML 去星工具（例如 StarNet、RC-Astro StarXTerminator CLI），取代內建的縮小/去星演算法。
+- **🧹 降噪**："fast"（雙邊濾波）模式讓即時預覽保持流暢，"quality"（Non-local Means）模式在最終匯出時提供更乾淨的結果，或選擇 "external" 模式改呼叫使用者自行安裝的 ML 降噪工具（例如 DeepSNR、RC-Astro NoiseXTerminator CLI），三者各有獨立的控制項。
+- **🎯 自動局部拉伸**：透過局部對比分析自動偵測有結構的區域（星雲、銀河塵埃帶等），只加強該處對比，天空背景幾乎不受影響。內建遮罩預覽圖，可實際看到偵測到哪裡、加強力道多少。也支援選填的手動框選區域（矩形或橢圓，邊緣羽化與加強權重皆可調），用來覆蓋或補足自動偵測漏掉的目標。
+- **🎨 預設集與快照**：一鍵套用「銀河模式」「星雲模式」「重光害」等新手起手式，並提供具名的快照 A/B/C 插槽，可存成檔案、也能從檔案載入，讓常用組合不會因重新整理頁面而消失。
+- **📁 批次處理**：一次將目前參數套用到整個資料夾內的所有圖片，逐張顯示進度、耗時與即時 ETA，並於結束後給出成功/失敗摘要。
+- **🔌 外部 ML 工具介接**：降噪與去星都支援 "external" 模式，可改呼叫使用者自行安裝、自行取得授權的命令列工具（例如 DeepSNR、RC-Astro NoiseXTerminator/StarXTerminator CLI），取代內建演算法——程式本身完全不內建、不重新散布任何第三方模型。
 - **💾 高解析度匯出**：一鍵匯出高品質 JPEG 與 16-bit 無損 TIFF。可選額外輸出「星點遮罩」與「去星背景圖層」供後續手動疊圖。
 - **⚙️ 參數備份與還原**：支援將當前調圖參數匯出為 `.json` 檔案備份，並能隨時載入復原。
 - **🖥️ 實時系統監控**：介面內建 CPU、記憶體與 GPU 顯存 (VRAM) 使用率監控。
