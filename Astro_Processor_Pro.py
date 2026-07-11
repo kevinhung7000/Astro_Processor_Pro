@@ -39,6 +39,7 @@ import os
 import sys
 import json
 import base64
+import time
 
 # --- PyInstaller --noconsole 修正：無終端機時 sys.stdout/stderr 為 None ---
 # uvicorn 的 logging 設定會呼叫 stream.isatty()，None 沒有這個方法會直接崩潰，
@@ -120,14 +121,24 @@ _USE_GPU_FOR_BG = USE_GPU and not _IS_DIRECTML
 if _IS_DIRECTML:
     print("[加速後端] 偵測到 DirectML 後端 — 背景梯度估計強制走 CPU 路徑（避免 DirectML reflect pad 靜默錯誤導致彩虹色帶）")
 
+# GPU 背景估計失敗容忍度：允許「這張圖失敗、下一張圖再試」，
+# 只有連續失敗達到門檻才視為 GPU 環境真的有問題，永久退回 CPU（避免每張圖都白白花時間重試一個確定壞掉的 GPU）。
+_GPU_BG_FAIL_STREAK = 0
+_GPU_BG_FAIL_STREAK_LIMIT = 3
+
 # ③ 全域 ThreadPoolExecutor：避免每次 CPU 背景運算都重新建立/銷毀執行緒池
 _BG_POOL = ThreadPoolExecutor(max_workers=4)
 
-# ② 背景漸層快取：key=(img_id, downscale, min_filter, blur_sigma)，只保留最近 1 張圖的結果
+# ② 背景漸層快取：key=(img_id, downscale, min_filter, blur_sigma)
 #    引入執行緒鎖，確保 Gradio 併發連線時的快取操作安全
+#    改用 OrderedDict + 容量上限（LRU），而非「只保留最近 1 張圖、每次 miss 就整個清空」。
+#    單人使用時行為不變（反正只會有 1 張圖在跑）；但若未來變成多人同時連線，
+#    不同使用者處理不同圖片時就不會互相把對方剛算好的背景快取擠掉。
 import threading
+from collections import OrderedDict
 _BG_CACHE_LOCK = threading.Lock()
-_BG_CACHE: dict = {}   # { key: (bg_full_perchannel, bg_lum) }
+_BG_CACHE_MAX_ENTRIES = 8
+_BG_CACHE: "OrderedDict" = OrderedDict()   # { key: (bg_full_perchannel, bg_lum) }, LRU-ordered
 
 
 def _gaussian_kernel1d_torch(sigma, device, dtype):
@@ -311,7 +322,7 @@ def _compute_channel_background(channel, small_w, small_h, w, h, min_filter_size
 
 
 def remove_background_gradient(img, downscale, min_filter_size, blur_sigma, subtract_strength):
-    global USE_GPU, _BG_CACHE
+    global USE_GPU, _USE_GPU_FOR_BG, _BG_CACHE, _GPU_BG_FAIL_STREAK
     h, w, _ = img.shape
     small_h, small_w = max(8, int(h * downscale)), max(8, int(w * downscale))
     min_filter_size = max(1, int(round(min_filter_size)))
@@ -330,6 +341,8 @@ def remove_background_gradient(img, downscale, min_filter_size, blur_sigma, subt
 
     with _BG_CACHE_LOCK:
         cached = _BG_CACHE.get(_cache_key)
+        if cached is not None:
+            _BG_CACHE.move_to_end(_cache_key)  # 標記為最近使用
 
     if cached is not None:
         bg_full_perchannel, bg_lum = cached
@@ -348,11 +361,19 @@ def remove_background_gradient(img, downscale, min_filter_size, blur_sigma, subt
                 )
                 bg_full_perchannel = np.stack([results[0], results[1], results[2]], axis=-1)
                 bg_lum = results[3]
+                _GPU_BG_FAIL_STREAK = 0  # 這次成功了，重置連續失敗計數
             except Exception as e:
-                print(f"[加速後端] GPU 運算失敗,已自動退回 CPU 模式。錯誤訊息: {e}")
-                USE_GPU = False
+                _GPU_BG_FAIL_STREAK += 1
                 bg_full_perchannel = None
                 bg_lum = None
+                if _GPU_BG_FAIL_STREAK >= _GPU_BG_FAIL_STREAK_LIMIT:
+                    # 連續失敗達門檻，判定 GPU 環境真的有問題，才永久退回 CPU
+                    print(f"[加速後端] GPU 運算連續失敗 {_GPU_BG_FAIL_STREAK} 次,已永久退回 CPU 模式。錯誤訊息: {e}")
+                    USE_GPU = False
+                    _USE_GPU_FOR_BG = False
+                else:
+                    # 只有這一張圖退回 CPU，下一張圖仍會再嘗試 GPU
+                    print(f"[加速後端] GPU 運算失敗(第 {_GPU_BG_FAIL_STREAK}/{_GPU_BG_FAIL_STREAK_LIMIT} 次),本張圖退回 CPU,下一張圖仍會重試 GPU。錯誤訊息: {e}")
 
         if bg_full_perchannel is None:
             # ③ bg_downscale 預設 0.06，小圖面積極小（例如 6000×4000 → 360×240）。
@@ -371,9 +392,11 @@ def remove_background_gradient(img, downscale, min_filter_size, blur_sigma, subt
             )
 
         with _BG_CACHE_LOCK:
-            # 只保留最近 1 張圖的結果（避免記憶體無限成長）
-            _BG_CACHE.clear()
+            # 保留最近使用的最多 _BG_CACHE_MAX_ENTRIES 筆結果（LRU，避免記憶體無限成長）
             _BG_CACHE[_cache_key] = (bg_full_perchannel, bg_lum)
+            _BG_CACHE.move_to_end(_cache_key)
+            while len(_BG_CACHE) > _BG_CACHE_MAX_ENTRIES:
+                _BG_CACHE.popitem(last=False)  # 丟掉最久未使用的那筆
 
     # 以下使用快取或剛計算完的 bg_full_perchannel / bg_lum
     luminance = img[:, :, 0] * 0.299 + img[:, :, 1] * 0.587 + img[:, :, 2] * 0.114
@@ -439,6 +462,69 @@ def stretch_dynamic_range(img, black_pct, stretch_factor, white_pct):
 
 
 
+def detect_target_regions(img01, radius=40.0, sensitivity=1.0):
+    """自動偵測「有結構的目標區域」(星雲/銀河等)，回傳 0~1 的柔和遮罩。
+
+    原理：用一個偏大的半徑估計局部平均亮度(local_mean)，
+    計算原圖與該平均亮度的差異量(detail)，代表該處局部細節/對比的豐富程度——
+    平坦的天空背景 detail 接近 0，星雲的雲氣結構、銀河的塵埃帶則有連續且較大範圍的 detail。
+
+    刻意用「大半徑估計 + 再次中尺度平滑」而非直接抓單一像素的高頻雜訊，
+    是為了讓單顆亮星這種「小範圍尖峰」不容易被誤判成大片目標區域——
+    真正的星雲/銀河結構通常涵蓋較大範圍、有連續的中尺度細節起伏，而不是孤立的尖點。
+    """
+    h, w = img01.shape[:2]
+    lum = img01[:, :, 0] * 0.299 + img01[:, :, 1] * 0.587 + img01[:, :, 2] * 0.114
+
+    # 降到小圖跑，加速運算，同時順便濾掉像素級雜訊，只保留中大尺度結構
+    _STAT_MAX = 500
+    scale = min(1.0, _STAT_MAX / max(h, w, 1))
+    if scale < 0.95:
+        sw, sh = max(8, int(w * scale)), max(8, int(h * scale))
+        lum_small = cv2.resize(lum, (sw, sh), interpolation=cv2.INTER_AREA)
+    else:
+        lum_small = lum
+
+    r_small = max(2.0, radius * scale)
+    local_mean = gaussian_filter(lum_small, sigma=r_small)
+    detail = np.abs(lum_small - local_mean)
+    structure = gaussian_filter(detail, sigma=r_small * 0.5)  # 中尺度平均，壓掉單顆星造成的尖峰雜訊
+
+    # 用 percentile 正規化到 0~1，避免單一極端值把整張遮罩洗掉
+    lo = np.percentile(structure, 5)
+    hi = np.percentile(structure, 99)
+    mask_small = np.clip((structure - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+    mask_small = mask_small ** (1.0 / max(sensitivity, 0.05))  # sensitivity 越高，越容易判定為目標區域
+
+    mask = cv2.resize(mask_small.astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC)
+    mask = np.clip(gaussian_filter(mask, sigma=max(2.0, radius * 0.15)), 0.0, 1.0)  # 邊緣羽化，避免遮罩硬邊
+    return mask
+
+
+def apply_local_target_boost(img01, enable, strength, radius, sensitivity):
+    """在自動偵測到的目標區域(星雲/銀河等)內加強局部對比，天空背景則幾乎不受影響。
+
+    做法：對亮度做一次大半徑的 unsharp-mask(clarity 概念)，但套用強度依 detect_target_regions()
+    算出的遮罩逐像素加權——遮罩值高(有結構的區域)才吃到明顯的對比增強，
+    遮罩值接近 0 的平坦天空背景幾乎不變，藉此取代「整張圖統一拉伸」的做法。
+    色彩維持方式與 remove_background_gradient() 相同：只算亮度的增減比例，
+    再乘回三個色版，避免整體色偏。
+    """
+    if not enable or strength <= 0:
+        return img01, None
+
+    mask = detect_target_regions(img01, radius=radius, sensitivity=sensitivity)
+    lum = img01[:, :, 0] * 0.299 + img01[:, :, 1] * 0.587 + img01[:, :, 2] * 0.114
+    blur = gaussian_filter(lum, sigma=max(2.0, radius))
+    detail = lum - blur
+    boosted_lum = np.clip(lum + detail * strength * mask, 0.0, 1.0)
+
+    ratio = np.clip(boosted_lum / np.maximum(lum, 1e-4), 0.2, 5.0)
+    out = np.clip(img01 * ratio[:, :, None], 0.0, 1.0).astype(np.float32)
+    return out, mask
+
+
+
 def boost_saturation(img01, sat_boost, bright_boost, r_gain, g_gain, b_gain):
     gains = np.array([r_gain, g_gain, b_gain], dtype=np.float32)
     img01_color = np.clip(img01 * gains[None, None, :], 0, 1).astype(np.float32)
@@ -465,9 +551,22 @@ def apply_clarity_and_sharpen(img8, clarity_blur, clarity_strength, sharpen_blur
     return np.clip(sharpened, 0, 255).astype(np.uint8)
 
 
-def denoise(img8, enable, d, sigma_color, sigma_space):
+def denoise(img8, enable, mode, d, sigma_color, sigma_space, nlm_h, nlm_h_color):
+    """降噪。
+
+    mode = "fast"（預設）：雙邊濾波(bilateralFilter)，速度快，適合即時預覽與一般使用。
+    mode = "quality"：cv2.fastNlMeansDenoisingColored，屬於 Non-local Means 演算法，
+        會在整張圖搜尋相似的小區塊來平均，降噪效果通常比雙邊濾波乾淨、更能保留細節邊緣，
+        但運算量遠高於雙邊濾波（一般會慢上數倍到十倍以上），較適合最終高解析度匯出而非即時預覽。
+    """
     if not enable:
         return img8
+    if mode == "quality":
+        return cv2.fastNlMeansDenoisingColored(
+            img8, None,
+            h=float(nlm_h), hColor=float(nlm_h_color),
+            templateWindowSize=7, searchWindowSize=21,
+        )
     return cv2.bilateralFilter(img8, d=int(round(d)), sigmaColor=sigma_color, sigmaSpace=sigma_space)
 
 
@@ -777,9 +876,12 @@ def finish_pipeline(img01, p):
         img8_tmp = (np.clip(img_work, 0, 1) * 255).astype(np.uint8)
         img8_tmp = denoise(
             img8_tmp, enable=True,
+            mode=p.get('denoise_mode', 'fast'),
             d=p['denoise_d'],
             sigma_color=p['denoise_sigma_color'],
-            sigma_space=p['denoise_sigma_space']
+            sigma_space=p['denoise_sigma_space'],
+            nlm_h=p.get('denoise_nlm_h', 10),
+            nlm_h_color=p.get('denoise_nlm_h_color', 10),
         )
         img_work = img8_tmp.astype(np.float32) / 255.0
 
@@ -799,6 +901,34 @@ def finish_pipeline(img01, p):
         p['r_gain'], p['g_gain'], p['b_gain']
     )
     return img8
+
+
+def build_target_mask_overlay(img_uint8, mask, contour_thresh=0.35):
+    """把 detect_target_regions() 算出的目標遮罩，疊成半透明色塊 + 邊界輪廓線顯示在成品圖上，
+    方便使用者確認「自動局部拉伸」實際加強了哪些區域(可能同時有好幾片不相連的區域)。
+    遮罩值越高，該處疊色越明顯；平坦天空背景(遮罩≈0)幾乎維持原圖不變。
+
+    contour_thresh：把遮罩用這個門檻二值化後，用 cv2.findContours 畫出「演算法認定的邊界」——
+    findContours 本來就會回傳所有互不相連的輪廓，所以有好幾片星雲/銀河結構時，
+    每一片都會各自畫出一條邊界線，不會只框出其中一塊。
+    """
+    if mask is None or img_uint8 is None:
+        return None
+    h, w = img_uint8.shape[:2]
+    if mask.shape[:2] != (h, w):
+        mask = cv2.resize(mask.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+    overlay_color = np.array([255, 70, 70], dtype=np.float32)  # 半透明紅色，標示「有加強」的區域
+    alpha = np.clip(mask, 0.0, 1.0)[:, :, None] * 0.5  # 最高疊色不透明度限制在 50%，避免整張變色蓋掉原圖
+    base = img_uint8.astype(np.float32)
+    out = np.clip(base * (1 - alpha) + overlay_color[None, None, :] * alpha, 0, 255).astype(np.uint8)
+
+    # 邊界輪廓線：用門檻二值化後找輪廓，畫成亮黃色線條，讓「演算法看到的邊界」清楚可辨
+    mask_u8 = (np.clip(mask, 0, 1) * 255).astype(np.uint8)
+    _, binary = cv2.threshold(mask_u8, int(contour_thresh * 255), 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    line_thickness = max(1, round(min(h, w) / 300))
+    cv2.drawContours(out, contours, -1, (255, 255, 0), thickness=line_thickness)  # 亮黃色邊界線
+    return out
 
 
 def run_pipeline(img01, p, want_layers=False, preview_scale=1.0):
@@ -827,6 +957,13 @@ def run_pipeline(img01, p, want_layers=False, preview_scale=1.0):
 
     img = correct_color_cast(img, p['wb_enable'], p['wb_min'], p['wb_max'])
     img = stretch_dynamic_range(img, p['black_pct'], p['stretch_factor'], p['white_pct'])
+    img, target_mask = apply_local_target_boost(
+        img,
+        p.get('local_target_enable', False),
+        p.get('local_target_strength', 0.0),
+        p.get('local_target_radius', 40),
+        p.get('local_target_sensitivity', 1.0),
+    )
     pre_star_img = img
 
     # 星點縮小/去星相關的「等效參數」：預覽縮圖時已依 preview_scale 等比例縮小
@@ -866,7 +1003,8 @@ def run_pipeline(img01, p, want_layers=False, preview_scale=1.0):
     result = {
         'main': main_out,
         'mask': star_mask,
-        'starless': starless_out
+        'starless': starless_out,
+        'target_mask_overlay': build_target_mask_overlay(main_out, target_mask),
     }
     return result
 
@@ -1014,9 +1152,11 @@ PARAM_NAMES = [
     'bg_enable', 'bg_downscale', 'bg_min_filter', 'bg_blur_sigma', 'bg_subtract',
     'wb_enable', 'wb_min', 'wb_max',
     'black_pct', 'stretch_factor', 'white_pct',
+    'local_target_enable', 'local_target_strength', 'local_target_radius', 'local_target_sensitivity',
     'sat_boost', 'bright_boost', 'r_gain', 'g_gain', 'b_gain',
     'clarity_blur', 'clarity_strength', 'sharpen_blur', 'sharpen_amount',
-    'denoise_enable', 'denoise_d', 'denoise_sigma_color', 'denoise_sigma_space',
+    'denoise_enable', 'denoise_mode', 'denoise_d', 'denoise_sigma_color', 'denoise_sigma_space',
+    'denoise_nlm_h', 'denoise_nlm_h_color',
     'star_mode', 'star_kernel', 'star_thresh', 'star_max_area', 'star_max_area_large', 'star_aspect',
     'star_dilate', 'star_dilate_scale', 'star_shrink_kernel', 'star_shrink_iter', 'star_shrink_strength', 'star_inpaint_radius',
     'multiscale_enable', 'cluster_kernel', 'cluster_thresh', 'cluster_min_area', 'cluster_max_area',
@@ -1028,9 +1168,11 @@ DEFAULTS = [
     True, 0.06, 9, 6, 0.92,
     True, 0.6, 1.8,
     0.2, 12.0, 99.7,
+    False, 0.6, 40, 1.0,
     1.45, 1.03, 1.0, 1.0, 1.0,
     25, 0.35, 2, 1.25,
-    True, 5, 15, 15,
+    True, "fast", 5, 15, 15,
+    10, 10,
     "shrink", 5, 18, 250, 2500, 1.6,
     1, 0.15, 3, 1, 0.8, 5,
     True, 21, 12, 300, 15000,
@@ -1040,6 +1182,91 @@ DEFAULTS = [
 
 def collect_params(values):
     return dict(zip(PARAM_NAMES, values))
+
+
+# ============================================================
+# ========================= 新手預設集 (Presets) =================
+# ============================================================
+# 三組給新手的「起始參數」，都是以 DEFAULTS 為基底、只覆寫該情境下真正有感的幾個
+# 參數（背景扣除強度、拉伸曲線、飽和度、RGB 增益、降噪等），而不是每個滑桿都亂動。
+# 套用後仍是完整的一組參數（其餘沿用 DEFAULTS），方便新手有個「看起來對」的起點，
+# 再自行微調，而不是從全部預設值(可能完全不適合該情境)開始瞎猜。
+_PRESET_OVERRIDES = {
+    "milky_way": {
+        # 銀河模式：地景/銀河對比通常較強，背景漸層(光害/月光)明顯，飽和度可以拉高一些
+        "bg_subtract": 0.95,
+        "stretch_factor": 14.0,
+        "sat_boost": 1.6,
+        "clarity_strength": 0.4,
+    },
+    "nebula": {
+        # 星雲模式：需要拉出更多微弱暗部細節，加強紅色(H-alpha)訊號，通常會去星以利後續疊圖
+        "black_pct": 0.1,
+        "stretch_factor": 20.0,
+        "white_pct": 99.5,
+        "sat_boost": 1.3,
+        "r_gain": 1.15,
+        "star_mode": "remove",
+    },
+    "heavy_light_pollution": {
+        # 重光害：背景漸層更強更需要扣乾淨，白平衡容忍範圍加大以校正嚴重橘/黃色偏，
+        # 飽和度降低避免光害色偏被放大，同時光害环境常伴隨高 ISO 雜訊，加強降噪
+        "bg_subtract": 0.98,
+        "bg_blur_sigma": 8.0,
+        "wb_min": 0.5,
+        "wb_max": 2.0,
+        "g_gain": 0.9,
+        "sat_boost": 1.1,
+        "denoise_enable": True,
+        "denoise_d": 7,
+        "denoise_sigma_color": 20,
+        "denoise_sigma_space": 20,
+    },
+}
+
+
+def get_preset_values(preset_key):
+    """回傳指定 preset 完整的一組參數值（依 PARAM_NAMES 順序），供 gr.update 套用。"""
+    merged = dict(zip(PARAM_NAMES, DEFAULTS))
+    merged.update(_PRESET_OVERRIDES[preset_key])
+    return [merged[name] for name in PARAM_NAMES]
+
+
+def apply_preset_fn(preset_key, lang):
+    values = get_preset_values(preset_key)
+    preset_label = {
+        "milky_way":            ("銀河模式", "Milky Way"),
+        "nebula":               ("星雲模式", "Nebula"),
+        "heavy_light_pollution":("重光害",   "Heavy Light Pollution"),
+    }[preset_key]
+    name = preset_label[0] if lang == "zh" else preset_label[1]
+    status = f"✅ 已套用「{name}」預設參數，可再自行微調" if lang == "zh" else f"✅ Applied the '{name}' preset — feel free to fine-tune further"
+    return values + [status]
+
+
+# ============================================================
+# ========================= 參數快照 (Snapshots) ================
+# ============================================================
+# 讓使用者可以把「目前這組參數」暫存到 A / B / C 三個快取格，
+# 快速在 2-3 組候選設定間切換比較，而不用每次都手動記/調參數。
+# 快照只存在瀏覽器工作階段(gr.State)中，不寫入磁碟，重新整理頁面就會清空——
+# 若要長期保存，仍建議使用既有的「匯出當前參數(JSON)」功能。
+
+def save_snapshot_fn(slot_label, lang, *param_values):
+    p = collect_params(param_values)
+    import datetime
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    status = f"✅ 快照 {slot_label} 已儲存目前參數（{ts}）" if lang == "zh" else f"✅ Snapshot {slot_label} saved ({ts})"
+    return p, status
+
+
+def load_snapshot_fn(snapshot, slot_label, lang):
+    if snapshot is None:
+        msg = f"⚠️ 快照 {slot_label} 是空的，請先按「儲存」" if lang == "zh" else f"⚠️ Snapshot {slot_label} is empty — save it first"
+        return [gr.update() for _ in PARAM_NAMES] + [msg]
+    updates = [gr.update(value=snapshot[name]) for name in PARAM_NAMES]
+    msg = f"📥 已套用快照 {slot_label}" if lang == "zh" else f"📥 Snapshot {slot_label} applied"
+    return updates + [msg]
 
 # ============================================================
 # ========================= 參數匯入/匯出 =========================
@@ -1115,13 +1342,15 @@ def update_preview_fn(preview_base, preview_scale, full_img, use_full_res, lang,
         return None, None, None, msg, build_compare_slider_html(None, None, lang)
     p = collect_params(param_values)
     try:
+        t0 = time.perf_counter()
         result = run_pipeline(img_to_use, p, want_layers=False, preview_scale=scale_to_use)
+        elapsed = time.perf_counter() - t0
         main_out = result['main']
         hist_out = generate_histogram(main_out)
         original_uint8 = (np.clip(img_to_use, 0, 1) * 255).astype(np.uint8)
         tag = ("全解析度原圖運算" if lang == "zh" else "Full-res image processing") if use_full else ("縮圖運算" if lang == "zh" else "Thumbnail processing")
         slider_html = build_compare_slider_html(original_uint8, main_out, lang)
-        status_msg = f"✅ 預覽與 RGB 曲線已更新({tag})" if lang == "zh" else f"✅ Preview and RGB histogram updated ({tag})"
+        status_msg = f"✅ 預覽與 RGB 曲線已更新({tag}，{elapsed:.2f}s)" if lang == "zh" else f"✅ Preview and RGB histogram updated ({tag}, {elapsed:.2f}s)"
         return main_out, original_uint8, hist_out, status_msg, slider_html
     except Exception as e:
         err_msg = f"❌ 預覽發生錯誤: {e}" if lang == "zh" else f"❌ Preview error: {e}"
@@ -1140,21 +1369,27 @@ def layer_preview_fn(preview_base, preview_scale, full_img, use_full_res, lang, 
     scale_to_use = 1.0 if use_full else preview_scale
     if img_to_use is None:
         msg = "⚠️ 尚未載入圖片" if lang == "zh" else "⚠️ Image not loaded"
-        return None, None, msg
+        return None, None, None, msg
     p = collect_params(param_values)
     try:
+        t0 = time.perf_counter()
         result = run_pipeline(img_to_use, p, want_layers=True, preview_scale=scale_to_use)
+        elapsed = time.perf_counter() - t0
         mask = result.get('mask')
         starless = result.get('starless')
-        if mask is None:
-            msg = "ℹ️ 目前參數沒有偵測到任何星點遮罩" if lang == "zh" else "ℹ️ No star mask detected with current parameters"
-            return None, None, msg
+        target_overlay = result.get('target_mask_overlay')
         tag = ("全解析度原圖" if lang == "zh" else "Full resolution image") if use_full else ("縮圖版本，星點參數已依縮圖比例等比例換算" if lang == "zh" else "Thumbnail version, star parameters scaled accordingly")
-        status_msg = f"✅ 圖層預覽已產生({tag}，僅供參考)" if lang == "zh" else f"✅ Layer previews generated ({tag}, for reference only)"
-        return mask, starless, status_msg
+        if mask is None:
+            msg = f"ℹ️ 目前參數沒有偵測到任何星點遮罩({elapsed:.2f}s)" if lang == "zh" else f"ℹ️ No star mask detected with current parameters ({elapsed:.2f}s)"
+            if target_overlay is None:
+                return None, None, None, msg
+            # 星點遮罩雖然是空的，但自動局部拉伸遮罩仍然有效，照樣回傳讓使用者看到
+            return None, starless, target_overlay, msg
+        status_msg = f"✅ 圖層預覽已產生({tag}，僅供參考，{elapsed:.2f}s)" if lang == "zh" else f"✅ Layer previews generated ({tag}, for reference only, {elapsed:.2f}s)"
+        return mask, starless, target_overlay, status_msg
     except Exception as e:
         err_msg = f"❌ 錯誤: {e}" if lang == "zh" else f"❌ Error: {e}"
-        return None, None, err_msg
+        return None, None, None, err_msg
 
 
 def local_preview_fn(full_img, x_pct, y_pct, crop_px, lang, *param_values):
@@ -1192,7 +1427,9 @@ def local_preview_fn(full_img, x_pct, y_pct, crop_px, lang, *param_values):
 
     try:
         # 以 preview_scale=1.0 跑完整 pipeline（全解析度精度）
+        t0 = time.perf_counter()
         result = run_pipeline(crop_f32, p, want_layers=False, preview_scale=1.0)
+        elapsed = time.perf_counter() - t0
         processed_uint8 = result['main']
 
         # 產生標示裁切框的縮略圖
@@ -1210,9 +1447,9 @@ def local_preview_fn(full_img, x_pct, y_pct, crop_px, lang, *param_values):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 60, 60), 1, cv2.LINE_AA)
 
         coords_str = f"({x0},{y0})→({x1},{y1})"
-        msg = (f"✅ 局部預覽完成，裁切區域 {coords_str}，全解析度品質"
+        msg = (f"✅ 局部預覽完成，裁切區域 {coords_str}，全解析度品質，{elapsed:.2f}s"
                if lang == "zh" else
-               f"✅ Local preview done, crop {coords_str}, full-res quality")
+               f"✅ Local preview done, crop {coords_str}, full-res quality, {elapsed:.2f}s")
         return processed_uint8, thumb, msg
 
     except Exception as e:
@@ -1246,6 +1483,74 @@ def export_fn(full_img, out_dir, out_name, want_layers, lang, *param_values):
     except Exception as e:
         err_msg = f"❌ 匯出失敗: {e}" if lang == "zh" else f"❌ Export failed: {e}"
         return err_msg, None
+
+
+def batch_process_fn(folder, out_dir, want_layers, lang, *param_values):
+    """批次處理：對資料夾內每一張圖套用目前的參數集，逐一以全解析度處理並匯出。
+
+    設計成 generator（每處理完一張就 yield 一次最新狀態文字），這樣 Gradio 前端
+    可以即時顯示進度，而不用等全部檔案跑完才有畫面回饋——批次動輒數十張全解析度圖，
+    单次處理可能要好幾秒到幾十秒，沒有進度回饋的話使用者會誤以為卡死。
+
+    單張圖失敗（例如檔案損毀、記憶體不足）不會中斷整批次，只會記錄錯誤並繼續下一張，
+    最後在摘要裡列出成功/失敗數量與失敗檔名，方便使用者事後排查。
+    """
+    if not folder or not os.path.isdir(folder):
+        msg = "⚠️ 請先輸入有效的來源資料夾路徑" if lang == "zh" else "⚠️ Please enter a valid source folder path"
+        yield msg
+        return
+
+    files = sorted([f for f in os.listdir(folder) if f.lower().endswith(IMG_EXTS)])
+    if not files:
+        msg = "⚠️ 資料夾內沒有找到可處理的圖片" if lang == "zh" else "⚠️ No processable images found in this folder"
+        yield msg
+        return
+
+    if not out_dir:
+        out_dir = "outputs/batch"
+    os.makedirs(out_dir, exist_ok=True)
+    p = collect_params(param_values)
+
+    total = len(files)
+    done, failed = 0, []
+    log_lines = []
+
+    header = (f"🚀 批次處理開始，共 {total} 張圖片 → 輸出至 `{out_dir}`"
+               if lang == "zh" else
+               f"🚀 Batch started, {total} image(s) → output to `{out_dir}`")
+    yield header
+
+    for i, fname in enumerate(files, 1):
+        base_name = os.path.splitext(fname)[0]
+        try:
+            img = load_image_any(os.path.join(folder, fname))
+            result = run_pipeline(img, p, want_layers=want_layers, preview_scale=1.0)
+            save_image_files(result['main'], out_dir, base_name)
+            if want_layers and 'mask' in result:
+                cv2.imwrite(os.path.join(out_dir, f"{base_name}_starmask.png"), result['mask'])
+                save_image_files(result['starless'], out_dir, f"{base_name}_starless")
+            done += 1
+            log_lines.append(f"✅ [{i}/{total}] {fname}")
+        except Exception as e:
+            failed.append(fname)
+            log_lines.append(f"❌ [{i}/{total}] {fname}: {e}")
+
+        progress_tail = "\n".join(log_lines[-8:])  # 只顯示最近 8 行，避免訊息無限增長
+        status = (f"{header}\n\n⏳ 進度: {i}/{total}（成功 {done}，失敗 {len(failed)}）\n\n{progress_tail}"
+                   if lang == "zh" else
+                   f"{header}\n\n⏳ Progress: {i}/{total} (success {done}, failed {len(failed)})\n\n{progress_tail}")
+        yield status
+
+    if failed:
+        fail_list = "、".join(failed) if lang == "zh" else ", ".join(failed)
+        summary = (f"🏁 批次處理完成：成功 {done} 張，失敗 {len(failed)} 張 → `{out_dir}`\n\n失敗檔案：{fail_list}"
+                    if lang == "zh" else
+                    f"🏁 Batch finished: {done} succeeded, {len(failed)} failed → `{out_dir}`\n\nFailed files: {fail_list}")
+    else:
+        summary = (f"🏁 批次處理完成，全部 {done} 張圖片皆已成功匯出 → `{out_dir}`"
+                    if lang == "zh" else
+                    f"🏁 Batch finished, all {done} image(s) exported successfully → `{out_dir}`")
+    yield summary
 
 
 # ============================================================
@@ -1296,40 +1601,129 @@ UI_TRANSLATIONS = {
         "zh": ("預覽解析度(長邊像素)",  "縮圖越小處理越快，不影響最終匯出解析度"),
         "en": ("Preview Resolution (Max Dimension px)", "Smaller thumbnail = faster preview; does not affect final export quality"),
     },
-    "use_full_res_preview": {"zh": "即時預覽改用原圖全解析度運算(較慢但最準確)", "en": "Use Full Resolution for Live Preview (Slower but accurate)"},
+    "use_full_res_preview": {
+        "zh": ("即時預覽改用原圖全解析度運算(較慢但最準確)", "未勾選時使用縮圖運算，速度較快；勾選後直接用原圖跑全部流程"),
+        "en": ("Use Full Resolution for Live Preview (Slower but accurate)", "When unchecked, uses a downscaled thumbnail for speed; when checked, runs the full pipeline on the original image"),
+    },
     "load_btn": {"zh": "📥 載入圖片", "en": "📥 Load Image"},
     "cfg_export_btn": {"zh": "📤 匯出當前參數", "en": "📤 Export Current Parameters"},
     "cfg_import_file": {"zh": "匯入參數 JSON", "en": "Import Config JSON"},
     "bg_enable": {"zh": "啟用背景漸層去除", "en": "Enable Background Gradient Removal"},
-    "bg_downscale": {"zh": "估算縮圖比例", "en": "Background Downscale Ratio"},
-    "bg_min_filter": {"zh": "局部最暗值視窗", "en": "Local Minimum Filter Size"},
-    "bg_blur_sigma": {"zh": "背景平滑程度", "en": "Background Blur Sigma"},
-    "bg_subtract": {"zh": "扣除強度", "en": "Subtraction Strength"},
+    "bg_downscale": {
+        "zh": ("估算縮圖比例", "越小越快，但過小會失真"),
+        "en": ("Background Downscale Ratio", "Smaller = faster, but too small causes inaccuracy"),
+    },
+    "bg_min_filter": {
+        "zh": ("局部最暗值視窗", "星雲核心較大時應加大，避免誤判為背景"),
+        "en": ("Local Minimum Filter Size", "Increase for larger nebula cores to avoid misclassifying them as background"),
+    },
+    "bg_blur_sigma": {
+        "zh": ("背景平滑程度", "越高背景漸層過渡越平滑"),
+        "en": ("Background Blur Sigma", "Higher = smoother background gradient transition"),
+    },
+    "bg_subtract": {
+        "zh": ("扣除強度", "1.0 完全扣除，0.90-0.95 能保留自然天光"),
+        "en": ("Subtraction Strength", "1.0 = full subtraction; 0.90-0.95 preserves natural sky glow"),
+    },
     "wb_enable": {"zh": "啟用色偏校正(白平衡)", "en": "Enable Color Cast Correction (White Balance)"},
-    "wb_min": {"zh": "增益下限", "en": "Minimum Gain Limit"},
-    "wb_max": {"zh": "增益上限", "en": "Maximum Gain Limit"},
-    "black_pct": {"zh": "黑點百分位", "en": "Black Point Percentile"},
-    "stretch_factor": {"zh": "拉伸強度(arcsinh)", "en": "Stretch Factor (arcsinh)"},
-    "white_pct": {"zh": "白點百分位", "en": "White Point Percentile"},
-    "sat_boost": {"zh": "飽和度倍率", "en": "Saturation Boost Factor"},
+    "wb_min": {
+        "zh": ("增益下限", "限制最大縮小幅度，防顏色死掉"),
+        "en": ("Minimum Gain Limit", "Limits how much a channel can be reduced, preventing color clipping"),
+    },
+    "wb_max": {
+        "zh": ("增益上限", "限制最大放大倍率，防特定通道雜訊爆發"),
+        "en": ("Maximum Gain Limit", "Limits how much a channel can be boosted, preventing noise blowup in that channel"),
+    },
+    "black_pct": {
+        "zh": ("黑點百分位", "通常設 0.1-0.5%"),
+        "en": ("Black Point Percentile", "Typically set to 0.1-0.5%"),
+    },
+    "stretch_factor": {
+        "zh": ("拉伸強度(arcsinh)", "越高微弱星雲越明顯"),
+        "en": ("Stretch Factor (arcsinh)", "Higher = faint nebulosity becomes more visible"),
+    },
+    "white_pct": {
+        "zh": ("白點百分位", "99.7% 代表最亮前 0.3% 飽和成純白"),
+        "en": ("White Point Percentile", "99.7% means the brightest 0.3% of pixels are saturated to pure white"),
+    },
+    "acc_local_target": {"zh": "3️⃣b 自動局部拉伸(星雲/銀河區域)", "en": "3️⃣b Auto Localized Stretch (Nebula/Galaxy)"},
+    "local_target_enable": {
+        "zh": ("啟用自動局部拉伸", "自動抓出有結構的星雲/銀河區域，只加強該處對比，天空背景不受影響"),
+        "en": ("Enable Auto Localized Stretch", "Automatically finds textured nebula/galaxy regions and boosts contrast only there, leaving flat sky background untouched"),
+    },
+    "local_target_strength": {
+        "zh": ("局部拉伸強度", "0 代表關閉效果"),
+        "en": ("Local Stretch Strength", "0 disables the effect"),
+    },
+    "local_target_radius": {
+        "zh": ("偵測/加強半徑(px)", "約略對應星雲結構的尺度，太小會連星點都吃到"),
+        "en": ("Detection/Boost Radius (px)", "Roughly matches the scale of nebula structures; too small will also pick up stars"),
+    },
+    "local_target_sensitivity": {
+        "zh": ("偵測靈敏度", "越高，越多區域會被判定為『目標』而套用加強"),
+        "en": ("Detection Sensitivity", "Higher = more area gets classified as 'target' and boosted"),
+    },
+    "sat_boost": {
+        "zh": ("飽和度倍率", "銀河/星雲通常需 1.2-1.8 倍增益"),
+        "en": ("Saturation Boost Factor", "Milky Way/nebula shots typically need a 1.2-1.8x boost"),
+    },
     "bright_boost": {"zh": "明度倍率", "en": "Brightness Boost Factor"},
-    "r_gain": {"zh": "🔴 紅色通道增益", "en": "🔴 Red Gain"},
-    "g_gain": {"zh": "🟢 綠色通道增益", "en": "🟢 Green Gain"},
-    "b_gain": {"zh": "🔵 藍色通道增益", "en": "🔵 Blue Gain"},
-    "clarity_blur": {"zh": "Clarity 模糊半徑", "en": "Clarity Blur Radius"},
-    "clarity_strength": {"zh": "Clarity 強度", "en": "Clarity Strength"},
+    "r_gain": {
+        "zh": ("🔴 紅色通道增益", "加強發射星雲 H-alpha 訊號"),
+        "en": ("🔴 Red Gain", "Boosts emission nebula H-alpha signal"),
+    },
+    "g_gain": {
+        "zh": ("🟢 綠色通道增益", "通常用來壓低綠色夜空光害"),
+        "en": ("🟢 Green Gain", "Typically used to reduce green light-pollution cast"),
+    },
+    "b_gain": {
+        "zh": ("🔵 藍色通道增益", "加強反射星雲或藍色年輕恆星"),
+        "en": ("🔵 Blue Gain", "Boosts reflection nebulae or blue young stars"),
+    },
+    "clarity_blur": {
+        "zh": ("Clarity 模糊半徑", "越大越偏向中尺度結構"),
+        "en": ("Clarity Blur Radius", "Larger = emphasizes mid-scale structure more"),
+    },
+    "clarity_strength": {
+        "zh": ("Clarity 強度", "類似 Lightroom 清晰度"),
+        "en": ("Clarity Strength", "Similar to Lightroom's Clarity"),
+    },
     "sharpen_blur": {"zh": "銳化模糊半徑", "en": "Sharpen Blur Radius"},
-    "sharpen_amount": {"zh": "銳化程度", "en": "Sharpen Amount"},
+    "sharpen_amount": {
+        "zh": ("銳化程度", "過大會使雜訊粒子變粗"),
+        "en": ("Sharpen Amount", "Too high will make noise grain coarser"),
+    },
     "denoise_enable": {"zh": "啟用降噪", "en": "Enable Denoise"},
-    "denoise_d": {"zh": "濾波視窗", "en": "Bilateral Filter Diameter (d)"},
-    "denoise_sigma_color": {"zh": "顏色 Sigma", "en": "Denoise Sigma Color"},
-    "denoise_sigma_space": {"zh": "空間 Sigma", "en": "Denoise Sigma Space"},
+    "denoise_mode": {
+        "zh": ("降噪模式", "fast=雙邊濾波(快); quality=Non-local Means(較乾淨但慢很多，適合最終匯出)"),
+        "en": ("Denoise Mode", "fast = Bilateral Filter (quick); quality = Non-local Means (cleaner but much slower, best for final export)"),
+    },
+    "denoise_d": {
+        "zh": ("[fast]濾波視窗", "較大數值降噪範圍廣但耗時"),
+        "en": ("[fast] Bilateral Filter Diameter (d)", "Larger values denoise a wider area but take longer"),
+    },
+    "denoise_sigma_color": {"zh": "[fast]顏色 Sigma", "en": "[fast] Denoise Sigma Color"},
+    "denoise_sigma_space": {"zh": "[fast]空間 Sigma", "en": "[fast] Denoise Sigma Space"},
+    "denoise_nlm_h": {
+        "zh": ("[quality]亮度降噪強度 h", "越高越乾淨，但可能抹掉細節"),
+        "en": ("[quality] Luminance Denoise Strength (h)", "Higher = cleaner but may erase detail"),
+    },
+    "denoise_nlm_h_color": {"zh": "[quality]色彩降噪強度 hColor", "en": "[quality] Color Denoise Strength (hColor)"},
     "star_mode": {"zh": "模式", "en": "Star Processing Mode"},
-    "star_kernel": {"zh": "偵測核大小(≈星點直徑px)", "en": "Star Detection Kernel Size (px)"},
-    "star_thresh": {"zh": "偵測門檻", "en": "Star Detection Threshold"},
+    "star_kernel": {
+        "zh": ("偵測核大小(≈星點直徑px)", "應略大於想抓取的中小型星點直徑"),
+        "en": ("Star Detection Kernel Size (px)", "Should be slightly larger than the diameter of the small/medium stars you want to detect"),
+    },
+    "star_thresh": {
+        "zh": ("偵測門檻", "越低暗星越多，過低會誤抓背景熱雜訊"),
+        "en": ("Star Detection Threshold", "Lower = more faint stars detected; too low will pick up background hot-pixel noise"),
+    },
     "star_max_area": {"zh": "星點最大面積", "en": "Maximum Star Area (px²)"},
     "star_max_area_large": {"zh": "亮星暈光面積上限", "en": "Maximum Bright Star Halo Area (px²)"},
-    "star_aspect": {"zh": "圓度門檻(長寬比)", "en": "Star Aspect Ratio Threshold"},
+    "star_aspect": {
+        "zh": ("圓度門檻(長寬比)", "排除長條形星雲結構"),
+        "en": ("Star Aspect Ratio Threshold", "Excludes elongated nebula structures"),
+    },
     "star_dilate": {"zh": "遮罩外擴基本像素", "en": "Mask Dilation Base px"},
     "star_dilate_scale": {"zh": "依星點大小外擴比例", "en": "Mask Dilation Size-dependent Scale"},
     "star_shrink_kernel": {"zh": "[縮星]侵蝕核大小", "en": "[Shrink] Erosion Kernel Size"},
@@ -1337,7 +1731,10 @@ UI_TRANSLATIONS = {
     "star_shrink_strength": {"zh": "[縮星]套用強度", "en": "[Shrink] Apply Strength"},
     "star_inpaint_radius": {"zh": "[去星]單星取樣半徑", "en": "[Remove] Inpaint Radius (px)"},
     "star_feather_px": {"zh": "[去星]邊緣羽化程度", "en": "[Remove] Edge Feathering px"},
-    "star_noise_strength": {"zh": "[去星]雜訊回填強度", "en": "[Remove] Noise Infill Strength"},
+    "star_noise_strength": {
+        "zh": ("[去星]雜訊回填強度", "0 為不回填"),
+        "en": ("[Remove] Noise Infill Strength", "0 = no noise infill"),
+    },
     "multiscale_enable": {"zh": "啟用大範圍偵測", "en": "Enable Multi-scale Star Detection"},
     "cluster_kernel": {"zh": "偵測核大小", "en": "Cluster Detection Kernel Size"},
     "cluster_thresh": {"zh": "偵測門檻", "en": "Cluster Detection Threshold"},
@@ -1347,12 +1744,15 @@ UI_TRANSLATIONS = {
     "cluster_dilate": {"zh": "遮罩外擴像素", "en": "Cluster Mask Dilation px"},
     "cluster_inpaint_radius": {"zh": "[去星]星團取樣半徑", "en": "[Remove] Cluster Inpaint Radius"},
     "reset_btn": {"zh": "↩️ 重設為預設值", "en": "↩️ Reset to Default Values"},
-    "compare_mode": {"zh": "原圖對比模式", "en": "Compare Mode"},
     "original_preview_image": {"zh": "原圖(未處理)", "en": "Original (Unprocessed)"},
     "preview_image": {"zh": "即時預覽效果(處理後)", "en": "Live Preview (Processed)"},
     "layer_preview_btn": {"zh": "🔄 產生 / 更新圖層預覽", "en": "🔄 Generate / Update Layer Preview"},
     "mask_image": {"zh": "星點遮罩 (Star Mask)", "en": "Star Mask"},
     "starless_image": {"zh": "去星背景層 (Starless)", "en": "Starless Sky Layer"},
+    "target_mask_overlay_image": {
+        "zh": ("自動局部拉伸偵測區域 (Auto Local Target)", "紅色疊色越明顯代表加強力道越大；黃色線為演算法判定的區域邊界"),
+        "en": ("Auto Local Target Detection", "Stronger red overlay = more boost applied; yellow line marks the detected region boundary"),
+    },
     "output_dir": {"zh": "輸出資料夾", "en": "Output Directory"},
     "output_name": {"zh": "輸出檔名(不含副檔名)", "en": "Output Filename (without extension)"},
     "save_layers": {"zh": "額外輸出星點遮罩 + 去星背景層(可供後續人工疊圖疊加)", "en": "Export Star Mask and Starless Layers (for manual stacking)"},
@@ -1396,6 +1796,50 @@ UI_TRANSLATIONS = {
         "zh": "**局部預覽**：從原圖裁一小塊，以全解析度品質跑完整流程，結果和最終匯出完全一致。\n\n調整下方 X/Y 位置滑桿選取感興趣的區域，點「更新」即可。",
         "en": "**Local Preview**: Crop a small region from the original image and run the full pipeline at 100% resolution. The result matches the final export exactly.\n\nAdjust X/Y sliders to select your region of interest, and click 'Update' to refresh."
     },
+    "tab_batch": {"zh": "🗂️ 批次處理", "en": "🗂️ Batch Processing"},
+    "batch_hint_md": {
+        "zh": "**批次處理**：把目前調好的參數，套用到「📂 選圖 & 設定」分頁中來源資料夾裡的每一張圖片，逐一以全解析度處理並輸出。\n\n⚠️ 建議先用單張圖片調好參數、確認效果滿意後，再執行批次處理。",
+        "en": "**Batch Processing**: Applies the current parameter set to every image in the source folder from the '📂 Image & Config' tab, processing and exporting each one at full resolution.\n\n⚠️ Tip: tune parameters on a single image first, then run the batch once you're happy with the result.",
+    },
+    "batch_out_dir": {"zh": "批次輸出資料夾", "en": "Batch Output Folder"},
+    "batch_want_layers": {"zh": "每張圖同時輸出星點遮罩 + 去星背景層", "en": "Also export star mask + starless layer for each image"},
+    "batch_btn": {"zh": "🚀 開始批次處理整個資料夾", "en": "🚀 Start Batch Processing"},
+    "close_btn": {"zh": "✕ 關閉", "en": "✕ Close"},
+    "presets_hint_md": {
+        "zh": "**🎛️ 新手預設集**：先選一個接近你拍攝情境的起點，再自行微調。",
+        "en": "**🎛️ Beginner Presets**: Pick a starting point close to your shooting scenario, then fine-tune from there.",
+    },
+    "preset_milky_way_btn": {"zh": "🌌 銀河模式", "en": "🌌 Milky Way"},
+    "preset_nebula_btn": {"zh": "🌫️ 星雲模式", "en": "🌫️ Nebula"},
+    "preset_light_pollution_btn": {"zh": "🏙️ 重光害", "en": "🏙️ Heavy Light Pollution"},
+    "snapshot_hint_md": {
+        "zh": "**📌 參數快照**：先「儲存」目前這組參數到 A/B/C，之後可以隨時「套用」快速切回比較，不用重新調整滑桿。快照只暫存在這次瀏覽器工作階段中，重新整理頁面會清空。",
+        "en": "**📌 Parameter Snapshots**: 'Save' the current parameter set to slot A/B/C, then 'Apply' any time to switch back instantly for comparison — no need to re-adjust sliders. Snapshots only live in this browser session and are cleared on page refresh.",
+    },
+    "snap_a_save_btn": {"zh": "💾 儲存為 A", "en": "💾 Save as A"},
+    "snap_a_load_btn": {"zh": "📥 套用 A", "en": "📥 Apply A"},
+    "snap_b_save_btn": {"zh": "💾 儲存為 B", "en": "💾 Save as B"},
+    "snap_b_load_btn": {"zh": "📥 套用 B", "en": "📥 Apply B"},
+    "snap_c_save_btn": {"zh": "💾 儲存為 C", "en": "💾 Save as C"},
+    "snap_c_load_btn": {"zh": "📥 套用 C", "en": "📥 Apply C"},
+}
+
+# 以下是「初次載入畫面時」的預設佔位訊息（尚未做任何操作前顯示）。
+# 因為這些欄位平常會被 load_image_fn / export_config_fn / update_preview_fn 等函式
+# 覆寫成真正的處理結果訊息，所以切換語言時「不能」無條件覆寫——否則會把使用者
+# 已經看到的真實狀態（例如「已載入 xxx.tif」）洗成空白佔位字，而是要先比對目前顯示
+# 的文字是否仍然是「初始佔位字」，是的話才跟著語言切換，其餘一律保留原文字。
+PLACEHOLDER_TEXTS = {
+    "load_status":         {"zh": "尚未載入圖片",       "en": "No image loaded yet"},
+    "cfg_status":          {"zh": "尚未執行匯入/匯出",   "en": "No import/export performed yet"},
+    "preview_status":      {"zh": "等待圖片載入...",     "en": "Waiting for image to load..."},
+    "compare_slider_html": {
+        "zh": "<div style='color:#888;padding:40px;text-align:center;'>⚠️ 尚未載入圖片</div>",
+        "en": "<div style='color:#888;padding:40px;text-align:center;'>⚠️ No image loaded yet</div>",
+    },
+    "snap_a_status": {"zh": "🔲 快照 A：尚未儲存", "en": "🔲 Snapshot A: not saved yet"},
+    "snap_b_status": {"zh": "🔲 快照 B：尚未儲存", "en": "🔲 Snapshot B: not saved yet"},
+    "snap_c_status": {"zh": "🔲 快照 C：尚未儲存", "en": "🔲 Snapshot C: not saved yet"},
 }
 
 # ============================================================
@@ -1977,6 +2421,9 @@ with gr.Blocks(
     state_preview_scale = gr.State(1.0)
     state_lang          = gr.State("zh")
     focus_mode          = gr.State(False)
+    state_snap_a        = gr.State(None)
+    state_snap_b        = gr.State(None)
+    state_snap_c        = gr.State(None)
 
     # ── Top Toolbar (Gradio Row) ──────────────────────────────
     with gr.Row(elem_id="pro-toolbar-row", equal_height=True):
@@ -2065,6 +2512,36 @@ with gr.Blocks(
 
                 # ── Tab: All Parameters ───────────────────────
                 with gr.Tab("⚙️ 參數調整") as tab_param:
+
+                    # ── Presets：給新手的起始參數 ──────────────
+                    with gr.Group(elem_id="presets-group"):
+                        presets_hint_md = gr.Markdown("**🎛️ 新手預設集**：先選一個接近你拍攝情境的起點，再自行微調。")
+                        with gr.Row():
+                            preset_milky_way_btn = gr.Button("🌌 銀河模式", size="sm")
+                            preset_nebula_btn    = gr.Button("🌫️ 星雲模式", size="sm")
+                            preset_light_pollution_btn = gr.Button("🏙️ 重光害", size="sm")
+                        preset_status = gr.Markdown("")
+
+                    # ── 參數快照：A / B / C 三組快速比較 ─────────
+                    with gr.Group(elem_id="snapshots-group"):
+                        snapshot_hint_md = gr.Markdown(
+                            "**📌 參數快照**：先「儲存」目前這組參數到 A/B/C，之後可以隨時「套用」快速切回比較，"
+                            "不用重新調整滑桿。快照只暫存在這次瀏覽器工作階段中，重新整理頁面會清空。"
+                        )
+                        with gr.Row():
+                            with gr.Column(min_width=0):
+                                snap_a_save_btn = gr.Button("💾 儲存為 A", size="sm")
+                                snap_a_load_btn = gr.Button("📥 套用 A", size="sm")
+                                snap_a_status = gr.Markdown("🔲 快照 A：尚未儲存")
+                            with gr.Column(min_width=0):
+                                snap_b_save_btn = gr.Button("💾 儲存為 B", size="sm")
+                                snap_b_load_btn = gr.Button("📥 套用 B", size="sm")
+                                snap_b_status = gr.Markdown("🔲 快照 B：尚未儲存")
+                            with gr.Column(min_width=0):
+                                snap_c_save_btn = gr.Button("💾 儲存為 C", size="sm")
+                                snap_c_load_btn = gr.Button("📥 套用 C", size="sm")
+                                snap_c_status = gr.Markdown("🔲 快照 C：尚未儲存")
+
                     with gr.Group():
 
                         with gr.Accordion("1️⃣ 背景漸層去除(去光害/朦朧)", open=False) as acc_bg:
@@ -2084,9 +2561,15 @@ with gr.Blocks(
                             stretch_factor = gr.Slider(1,  200, value=12,   step=0.5,  label="拉伸強度(arcsinh)", info="越高微弱星雲越明顯")
                             white_pct      = gr.Slider(90, 100, value=99.7, step=0.1,  label="白點百分位", info="99.7% 代表最亮前 0.3% 飽和成純白")
 
+                        with gr.Accordion("3️⃣b 自動局部拉伸(星雲/銀河區域)", open=False) as acc_local_target:
+                            local_target_enable      = gr.Checkbox(label="啟用自動局部拉伸", value=DEFAULTS[11], info="自動抓出有結構的星雲/銀河區域，只加強該處對比，天空背景不受影響")
+                            local_target_strength    = gr.Slider(0,   2,   value=0.6,  step=0.05, label="局部拉伸強度", info="0 代表關閉效果")
+                            local_target_radius      = gr.Slider(10,  120, value=40,   step=5,    label="偵測/加強半徑(px)", info="約略對應星雲結構的尺度，太小會連星點都吃到")
+                            local_target_sensitivity = gr.Slider(0.3, 3,   value=1.0,  step=0.1,  label="偵測靈敏度", info="越高，越多區域會被判定為『目標』而套用加強")
+
                         with gr.Accordion("4️⃣ 飽和度 / 明度 / RGB通道", open=True) as acc_sat:
                             sat_boost    = gr.Slider(0.5, 3,   value=1.45, step=0.05, label="飽和度倍率", info="銀河/星雲通常需 1.2-1.8 倍增益")
-                            bright_boost = gr.Slider(0.5, 2,   value=1.03, step=0.01, label="明度倍率")
+                            bright_boost = gr.Slider(0.5, 2,   value=1.03, step=0.01, label="明度倍率", info="整體亮度微調，通常接近 1.0 即可，避免過曝")
                             r_gain       = gr.Slider(0.5, 1.5, value=1.0,  step=0.01, label="🔴 紅色通道增益", info="加強發射星雲 H-alpha 訊號")
                             g_gain       = gr.Slider(0.5, 1.5, value=1.0,  step=0.01, label="🟢 綠色通道增益", info="通常用來壓低綠色夜空光害")
                             b_gain       = gr.Slider(0.5, 1.5, value=1.0,  step=0.01, label="🔵 藍色通道增益", info="加強反射星雲或藍色年輕恆星")
@@ -2094,40 +2577,43 @@ with gr.Blocks(
                         with gr.Accordion("5️⃣ Clarity(局部對比) / 銳化", open=False) as acc_clarity:
                             clarity_blur     = gr.Slider(1,   60,  value=25,   step=1,    label="Clarity 模糊半徑", info="越大越偏向中尺度結構")
                             clarity_strength = gr.Slider(0,   1,   value=0.35, step=0.01, label="Clarity 強度", info="類似 Lightroom 清晰度")
-                            sharpen_blur     = gr.Slider(0.5, 10,  value=2,    step=0.1,  label="銳化模糊半徑")
+                            sharpen_blur     = gr.Slider(0.5, 10,  value=2,    step=0.1,  label="銳化模糊半徑", info="決定銳化鎖定的細節尺度，越大銳化範圍越粗")
                             sharpen_amount   = gr.Slider(0.5, 3,   value=1.25, step=0.01, label="銳化程度", info="過大會使雜訊粒子變粗")
 
                         with gr.Accordion("6️⃣ 降噪", open=False) as acc_denoise:
-                            denoise_enable      = gr.Checkbox(label="啟用降噪", value=DEFAULTS[20])
-                            denoise_d           = gr.Slider(1, 15, value=5,  step=1, label="濾波視窗", info="較大數值降噪範圍廣但耗時")
-                            denoise_sigma_color = gr.Slider(1, 50, value=15, step=1, label="顏色 Sigma")
-                            denoise_sigma_space = gr.Slider(1, 50, value=15, step=1, label="空間 Sigma")
+                            denoise_enable      = gr.Checkbox(label="啟用降噪", value=DEFAULTS[24])
+                            denoise_mode        = gr.Radio(["fast", "quality"], value="fast", label="降噪模式", info="fast=雙邊濾波(快); quality=Non-local Means(較乾淨但慢很多，適合最終匯出)")
+                            denoise_d           = gr.Slider(1, 15, value=5,  step=1, label="[fast]濾波視窗", info="較大數值降噪範圍廣但耗時")
+                            denoise_sigma_color = gr.Slider(1, 50, value=15, step=1, label="[fast]顏色 Sigma", info="越高越能融合差異較大的顏色，但可能糊掉色彩邊界")
+                            denoise_sigma_space = gr.Slider(1, 50, value=15, step=1, label="[fast]空間 Sigma", info="越高影響範圍越大的鄰近像素，降噪更平滑但更慢")
+                            denoise_nlm_h       = gr.Slider(1, 30, value=10, step=1, label="[quality]亮度降噪強度 h", info="越高越乾淨，但可能抹掉細節")
+                            denoise_nlm_h_color = gr.Slider(1, 30, value=10, step=1, label="[quality]色彩降噪強度 hColor", info="越高色彩雜訊越乾淨，但可能造成色塊化")
 
                         with gr.Accordion("7️⃣ 星點縮小 / 去星", open=False) as acc_star:
                             star_mode           = gr.Radio(["none","shrink","remove"], value="shrink", label="模式")
                             star_kernel         = gr.Slider(3,  15,   value=5,    step=1,    label="偵測核大小(≈星點直徑px)", info="應略大於想抓取的中小型星點直徑")
                             star_thresh         = gr.Slider(1,  60,   value=18,   step=1,    label="偵測門檻", info="越低暗星越多，過低會誤抓背景熱雜訊")
-                            star_max_area       = gr.Slider(20, 1000, value=250,  step=10,   label="星點最大面積")
-                            star_max_area_large = gr.Slider(500,5000, value=2500, step=50,   label="亮星暈光面積上限")
+                            star_max_area       = gr.Slider(20, 1000, value=250,  step=10,   label="星點最大面積", info="超過此面積的斑塊不視為一般星點，避免誤抓星雲亮核")
+                            star_max_area_large = gr.Slider(500,5000, value=2500, step=50,   label="亮星暈光面積上限", info="超過此面積直接排除，避免大範圍暈光被誤判為星點")
                             star_aspect         = gr.Slider(1,  3,    value=1.6,  step=0.05, label="圓度門檻(長寬比)", info="排除長條形星雲結構")
-                            star_dilate         = gr.Slider(0,  10,   value=1,    step=1,    label="遮罩外擴基本像素")
-                            star_dilate_scale   = gr.Slider(0,  1,    value=0.15, step=0.01, label="依星點大小外擴比例")
-                            star_shrink_kernel  = gr.Slider(1,  9,    value=3,    step=1,    label="[縮星]侵蝕核大小")
-                            star_shrink_iter    = gr.Slider(1,  5,    value=1,    step=1,    label="[縮星]侵蝕次數")
-                            star_shrink_strength= gr.Slider(0,  1,    value=0.8,  step=0.01, label="[縮星]套用強度")
-                            star_inpaint_radius = gr.Slider(1,  20,   value=5,    step=1,    label="[去星]單星取樣半徑")
-                            star_feather_px     = gr.Slider(0,  8,    value=2.0,  step=0.25, label="[去星]邊緣羽化程度")
+                            star_dilate         = gr.Slider(0,  10,   value=1,    step=1,    label="遮罩外擴基本像素", info="每個星點遮罩固定外擴的像素數，確保完整覆蓋星點邊緣")
+                            star_dilate_scale   = gr.Slider(0,  1,    value=0.15, step=0.01, label="依星點大小外擴比例", info="星點越大外擴越多，避免大星周圍殘留光暈")
+                            star_shrink_kernel  = gr.Slider(1,  9,    value=3,    step=1,    label="[縮星]侵蝕核大小", info="每次侵蝕使用的核心大小，越大縮星效果越明顯")
+                            star_shrink_iter    = gr.Slider(1,  5,    value=1,    step=1,    label="[縮星]侵蝕次數", info="重複侵蝕的次數，越多星點縮得越小")
+                            star_shrink_strength= gr.Slider(0,  1,    value=0.8,  step=0.01, label="[縮星]套用強度", info="0 為不縮星，1 為完全套用侵蝕結果")
+                            star_inpaint_radius = gr.Slider(1,  20,   value=5,    step=1,    label="[去星]單星取樣半徑", info="從星點周圍多遠的範圍取樣來填補去星後的背景")
+                            star_feather_px     = gr.Slider(0,  8,    value=2.0,  step=0.25, label="[去星]邊緣羽化程度", info="去星邊界的柔化寬度，越高過渡越自然但越模糊")
                             star_noise_strength = gr.Slider(0,  2,    value=1.0,  step=0.05, label="[去星]雜訊回填強度", info="0 為不回填")
 
                         with gr.Accordion("7️⃣b 大範圍偵測(密集星團/大片暈光)", open=False) as acc_cluster:
-                            multiscale_enable      = gr.Checkbox(label="啟用大範圍偵測", value=DEFAULTS[35])
-                            cluster_kernel         = gr.Slider(5,    50,    value=21,    step=1,   label="偵測核大小")
-                            cluster_thresh         = gr.Slider(1,    60,    value=12,    step=1,   label="偵測門檻")
-                            cluster_min_area       = gr.Slider(50,   2000,  value=300,   step=10,  label="最小面積")
-                            cluster_max_area       = gr.Slider(2000, 30000, value=15000, step=100, label="最大面積")
-                            cluster_aspect         = gr.Slider(1,    5,     value=2.5,   step=0.1, label="長寬比門檻")
-                            cluster_dilate         = gr.Slider(0,    15,    value=4,     step=1,   label="遮罩外擴像素")
-                            cluster_inpaint_radius = gr.Slider(1,    30,    value=14,    step=1,   label="[去星]星團取樣半徑")
+                            multiscale_enable      = gr.Checkbox(label="啟用大範圍偵測", value=DEFAULTS[43])
+                            cluster_kernel         = gr.Slider(5,    50,    value=21,    step=1,   label="偵測核大小", info="用來偵測大範圍密集星團的局部視窗，應大於一般星點")
+                            cluster_thresh         = gr.Slider(1,    60,    value=12,    step=1,   label="偵測門檻", info="越低越容易把稀疏星群也判定為星團")
+                            cluster_min_area       = gr.Slider(50,   2000,  value=300,   step=10,  label="最小面積", info="小於此面積不視為星團，避免與一般星點混淆")
+                            cluster_max_area       = gr.Slider(2000, 30000, value=15000, step=100, label="最大面積", info="超過此面積可能是星雲亮區而非星團，會被排除")
+                            cluster_aspect         = gr.Slider(1,    5,     value=2.5,   step=0.1, label="長寬比門檻", info="排除過於狹長的區域，避免誤抓塵埃帶或條紋雜訊")
+                            cluster_dilate         = gr.Slider(0,    15,    value=4,     step=1,   label="遮罩外擴像素", info="星團遮罩外擴的像素數，確保完整覆蓋週邊暗星")
+                            cluster_inpaint_radius = gr.Slider(1,    30,    value=14,    step=1,   label="[去星]星團取樣半徑", info="去除星團時，從多遠範圍取樣填補背景")
 
                     reset_btn = gr.Button("↩️ 重設為預設值", variant="secondary")
 
@@ -2171,6 +2657,7 @@ with gr.Blocks(
                     with gr.Row():
                         mask_image     = gr.Image(label="星點遮罩 (Star Mask)",    type="numpy")
                         starless_image = gr.Image(label="去星背景層 (Starless)",   type="numpy")
+                        target_mask_overlay_image = gr.Image(label="自動局部拉伸偵測區域 (Auto Local Target)", type="numpy")
 
                 # ── Tab: Export ───────────────────────────────
                 with gr.Tab("💾 匯出全解析度") as tab_export:
@@ -2186,6 +2673,20 @@ with gr.Blocks(
                         label="下載生成的結果檔案", file_count="multiple"
                     )
 
+                # ── Tab: Batch Processing ──────────────────────
+                with gr.Tab("🗂️ 批次處理") as tab_batch:
+                    batch_hint_md = gr.Markdown(
+                        "**批次處理**：把目前調好的參數，套用到「📂 選圖 & 設定」分頁中"
+                        "來源資料夾裡的每一張圖片，逐一以全解析度處理並輸出。\n\n"
+                        "⚠️ 建議先用單張圖片調好參數、確認效果滿意後，再執行批次處理。"
+                    )
+                    batch_out_dir = gr.Textbox(label="批次輸出資料夾", value="outputs/batch")
+                    batch_want_layers = gr.Checkbox(
+                        label="每張圖同時輸出星點遮罩 + 去星背景層", value=False
+                    )
+                    batch_btn = gr.Button("🚀 開始批次處理整個資料夾", variant="primary")
+                    batch_status = gr.Markdown("")
+
                 # ── Tab: Local ROI Preview ────────────────────
                 with gr.Tab("⚡ 局部預覽") as tab_local:
                     local_hint_md = gr.Markdown(
@@ -2194,11 +2695,14 @@ with gr.Blocks(
                     )
                     with gr.Row():
                         local_x_pct  = gr.Slider(0, 100, value=50, step=0.5,
-                                                  label="X 中心位置 (%)", elem_id="local-x-pct")
+                                                  label="X 中心位置 (%)", elem_id="local-x-pct",
+                                                  info="裁切區域中心點的水平位置，以整張圖寬度的百分比表示")
                         local_y_pct  = gr.Slider(0, 100, value=50, step=0.5,
-                                                  label="Y 中心位置 (%)", elem_id="local-y-pct")
+                                                  label="Y 中心位置 (%)", elem_id="local-y-pct",
+                                                  info="裁切區域中心點的垂直位置，以整張圖高度的百分比表示")
                         local_crop_px = gr.Slider(128, 2000, value=512, step=64,
-                                                   label="裁切大小 (px)", elem_id="local-crop-px")
+                                                   label="裁切大小 (px)", elem_id="local-crop-px",
+                                                   info="裁切區域的邊長，越小處理越快但看到的範圍也越小")
                     local_preview_btn = gr.Button("⚡ 更新局部預覽", variant="primary",
                                                    elem_id="local-preview-btn")
                     local_status = gr.Markdown("")
@@ -2239,9 +2743,11 @@ with gr.Blocks(
         bg_enable, bg_downscale, bg_min_filter, bg_blur_sigma, bg_subtract,
         wb_enable, wb_min, wb_max,
         black_pct, stretch_factor, white_pct,
+        local_target_enable, local_target_strength, local_target_radius, local_target_sensitivity,
         sat_boost, bright_boost, r_gain, g_gain, b_gain,
         clarity_blur, clarity_strength, sharpen_blur, sharpen_amount,
-        denoise_enable, denoise_d, denoise_sigma_color, denoise_sigma_space,
+        denoise_enable, denoise_mode, denoise_d, denoise_sigma_color, denoise_sigma_space,
+        denoise_nlm_h, denoise_nlm_h_color,
         star_mode, star_kernel, star_thresh, star_max_area, star_max_area_large, star_aspect,
         star_dilate, star_dilate_scale, star_shrink_kernel, star_shrink_iter,
         star_shrink_strength, star_inpaint_radius,
@@ -2252,10 +2758,12 @@ with gr.Blocks(
 
     sliders_for_release = [
         bg_downscale, bg_min_filter, bg_blur_sigma, bg_subtract, wb_min, wb_max,
-        black_pct, stretch_factor, white_pct, sat_boost, bright_boost,
+        black_pct, stretch_factor, white_pct,
+        local_target_strength, local_target_radius, local_target_sensitivity,
+        sat_boost, bright_boost,
         r_gain, g_gain, b_gain,
         clarity_blur, clarity_strength, sharpen_blur, sharpen_amount,
-        denoise_d, denoise_sigma_color, denoise_sigma_space,
+        denoise_d, denoise_sigma_color, denoise_sigma_space, denoise_nlm_h, denoise_nlm_h_color,
         star_kernel, star_thresh, star_max_area, star_max_area_large, star_aspect,
         star_dilate, star_dilate_scale, star_shrink_kernel, star_shrink_iter,
         star_shrink_strength, star_inpaint_radius,
@@ -2263,7 +2771,7 @@ with gr.Blocks(
         cluster_aspect, cluster_dilate, cluster_inpaint_radius,
         star_feather_px, star_noise_strength,
     ]
-    toggles_for_change = [bg_enable, wb_enable, denoise_enable, star_mode, multiscale_enable]
+    toggles_for_change = [bg_enable, wb_enable, local_target_enable, denoise_enable, denoise_mode, star_mode, multiscale_enable]
 
     # Preview common inputs / outputs
     _PREV_IN  = [state_preview_base, state_preview_scale, state_full,
@@ -2293,6 +2801,11 @@ with gr.Blocks(
         (black_pct, "black_pct"),
         (stretch_factor, "stretch_factor"),
         (white_pct, "white_pct"),
+        (acc_local_target, "acc_local_target"),
+        (local_target_enable, "local_target_enable"),
+        (local_target_strength, "local_target_strength"),
+        (local_target_radius, "local_target_radius"),
+        (local_target_sensitivity, "local_target_sensitivity"),
         (sat_boost, "sat_boost"),
         (bright_boost, "bright_boost"),
         (r_gain, "r_gain"),
@@ -2303,9 +2816,12 @@ with gr.Blocks(
         (sharpen_blur, "sharpen_blur"),
         (sharpen_amount, "sharpen_amount"),
         (denoise_enable, "denoise_enable"),
+        (denoise_mode, "denoise_mode"),
         (denoise_d, "denoise_d"),
         (denoise_sigma_color, "denoise_sigma_color"),
         (denoise_sigma_space, "denoise_sigma_space"),
+        (denoise_nlm_h, "denoise_nlm_h"),
+        (denoise_nlm_h_color, "denoise_nlm_h_color"),
         (star_mode, "star_mode"),
         (star_kernel, "star_kernel"),
         (star_thresh, "star_thresh"),
@@ -2334,6 +2850,7 @@ with gr.Blocks(
         (layer_preview_btn, "layer_preview_btn"),
         (mask_image, "mask_image"),
         (starless_image, "starless_image"),
+        (target_mask_overlay_image, "target_mask_overlay_image"),
         (output_dir, "output_dir"),
         (output_name, "output_name"),
         (save_layers, "save_layers"),
@@ -2371,10 +2888,28 @@ with gr.Blocks(
         (local_overview_img, "local_overview_img"),
         (local_result_img, "local_result_img"),
         (local_hint_md, "local_hint_md"),
+        (tab_batch, "tab_batch"),
+        (batch_hint_md, "batch_hint_md"),
+        (batch_out_dir, "batch_out_dir"),
+        (batch_want_layers, "batch_want_layers"),
+        (batch_btn, "batch_btn"),
+        (close_btn, "close_btn"),
+        (presets_hint_md, "presets_hint_md"),
+        (preset_milky_way_btn, "preset_milky_way_btn"),
+        (preset_nebula_btn, "preset_nebula_btn"),
+        (preset_light_pollution_btn, "preset_light_pollution_btn"),
+        (snapshot_hint_md, "snapshot_hint_md"),
+        (snap_a_save_btn, "snap_a_save_btn"),
+        (snap_a_load_btn, "snap_a_load_btn"),
+        (snap_b_save_btn, "snap_b_save_btn"),
+        (snap_b_load_btn, "snap_b_load_btn"),
+        (snap_c_save_btn, "snap_c_save_btn"),
+        (snap_c_load_btn, "snap_c_load_btn"),
     ]
 
     def make_change_lang(lang):
-        def handler(is_focused):
+        def handler(is_focused, load_status_val, cfg_status_val, preview_status_val, compare_html_val,
+                    snap_a_status_val, snap_b_status_val, snap_c_status_val):
             updates = []
             for comp, key in TRANSLATED_COMPONENTS_MAP:
                 entry = UI_TRANSLATIONS[key]
@@ -2390,9 +2925,13 @@ with gr.Blocks(
                     updates.append(gr.update(value=btn_label))
                 elif key in ["scan_btn", "load_btn", "cfg_export_btn", "reset_btn",
                              "layer_preview_btn", "export_btn", "monitor_refresh_btn",
-                             "local_preview_btn"]:
+                             "local_preview_btn", "batch_btn", "close_btn",
+                             "preset_milky_way_btn", "preset_nebula_btn", "preset_light_pollution_btn",
+                             "snap_a_save_btn", "snap_a_load_btn", "snap_b_save_btn", "snap_b_load_btn",
+                             "snap_c_save_btn", "snap_c_load_btn"]:
                     updates.append(gr.update(value=label_txt))
-                elif key in ["cfg_header_md", "layer_hint_md", "local_hint_md"]:
+                elif key in ["cfg_header_md", "layer_hint_md", "local_hint_md", "batch_hint_md",
+                             "presets_hint_md", "snapshot_hint_md"]:
                     updates.append(gr.update(value=label_txt))
                 elif key == "compare_mode":
                     choices_zh = ["並排顯示", "滑桿疊圖"]
@@ -2403,10 +2942,34 @@ with gr.Blocks(
                     updates.append(gr.update(**kw))
                 elif info_txt is not None:
                     # 有 info 文字的欄位（如 preview_size）：同時更新 label 和 info
-                    updates.append(gr.update(label=label_txt, info=info_txt))
+                    # gr.Image 這類元件在目前版本的 Gradio 不支援 info 參數，
+                    # 傳入會直接丟例外導致切換語言失敗，因此改成併入 label 文字顯示
+                    if isinstance(comp, gr.Image):
+                        updates.append(gr.update(label=f"{label_txt}　{info_txt}"))
+                    else:
+                        updates.append(gr.update(label=label_txt, info=info_txt))
                 else:
                     updates.append(gr.update(label=label_txt))
-            return [lang] + updates
+
+            # ── 狀態/佔位文字：只有「目前顯示的內容仍是初始佔位字」時才跟著語言切換，
+            #    避免洗掉使用者已經看到的真實處理結果訊息（例如「已載入 xxx.tif」）。
+            def _swap_if_placeholder(current_val, ph_key):
+                zh_default, en_default = PLACEHOLDER_TEXTS[ph_key]["zh"], PLACEHOLDER_TEXTS[ph_key]["en"]
+                if current_val in (zh_default, en_default):
+                    return gr.update(value=PLACEHOLDER_TEXTS[ph_key][lang])
+                return gr.update()
+
+            status_updates = [
+                _swap_if_placeholder(load_status_val, "load_status"),
+                _swap_if_placeholder(cfg_status_val, "cfg_status"),
+                _swap_if_placeholder(preview_status_val, "preview_status"),
+                _swap_if_placeholder(compare_html_val, "compare_slider_html"),
+                _swap_if_placeholder(snap_a_status_val, "snap_a_status"),
+                _swap_if_placeholder(snap_b_status_val, "snap_b_status"),
+                _swap_if_placeholder(snap_c_status_val, "snap_c_status"),
+            ]
+
+            return [lang] + updates + status_updates
         return handler
 
 
@@ -2459,17 +3022,56 @@ with gr.Blocks(
         fn=update_preview_fn, inputs=_PREV_IN, outputs=_PREV_OUT,
     )
 
+    # ── Presets（新手起始參數）──────────────────────────────
+    def _make_preset_handler(preset_key):
+        def handler(lang):
+            *values, status = apply_preset_fn(preset_key, lang)
+            return values + [status]
+        return handler
+
+    for btn, key in [
+        (preset_milky_way_btn, "milky_way"),
+        (preset_nebula_btn, "nebula"),
+        (preset_light_pollution_btn, "heavy_light_pollution"),
+    ]:
+        btn.click(
+            fn=_make_preset_handler(key),
+            inputs=[state_lang],
+            outputs=PARAM_COMPONENTS + [preset_status],
+        ).then(
+            fn=update_preview_fn, inputs=_PREV_IN, outputs=_PREV_OUT,
+        )
+
+    # ── 參數快照 A / B / C ───────────────────────────────────
+    for save_btn, load_btn_snap, state_snap, status_comp, slot in [
+        (snap_a_save_btn, snap_a_load_btn, state_snap_a, snap_a_status, "A"),
+        (snap_b_save_btn, snap_b_load_btn, state_snap_b, snap_b_status, "B"),
+        (snap_c_save_btn, snap_c_load_btn, state_snap_c, snap_c_status, "C"),
+    ]:
+        save_btn.click(
+            fn=lambda lang, *pv, _slot=slot: save_snapshot_fn(_slot, lang, *pv),
+            inputs=[state_lang] + PARAM_COMPONENTS,
+            outputs=[state_snap, status_comp],
+        )
+        load_btn_snap.click(
+            fn=lambda snap, lang, _slot=slot: load_snapshot_fn(snap, _slot, lang),
+            inputs=[state_snap, state_lang],
+            outputs=PARAM_COMPONENTS + [status_comp],
+        ).then(
+            fn=update_preview_fn, inputs=_PREV_IN, outputs=_PREV_OUT,
+        )
+
     # ── Layer preview (also updates Star Mask mini in right panel) ──
     def _layer_with_mini(*args):
         """Wrapper: calls layer_preview_fn and duplicates mask to mask_mini."""
-        mask, starless, status = layer_preview_fn(*args)
-        return mask, starless, status, mask   # 4th = mask_mini
+        mask, starless, target_overlay, status = layer_preview_fn(*args)
+        return mask, starless, target_overlay, status, mask   # 5th = mask_mini
 
     layer_preview_btn.click(
         fn=_layer_with_mini,
         inputs=[state_preview_base, state_preview_scale, state_full,
                 use_full_res_preview, state_lang] + PARAM_COMPONENTS,
-        outputs=[mask_image, starless_image, preview_status, mask_mini],
+        outputs=[mask_image, starless_image, target_mask_overlay_image, preview_status, mask_mini],
     )
 
     # ── Full-res export ───────────────────────────────────────
@@ -2481,6 +3083,13 @@ with gr.Blocks(
         fn=get_status_bar_html,
         inputs=[state_lang],
         outputs=[status_bar_out],
+    )
+
+    # ── Batch processing (reuses folder_box from the load tab as source) ──
+    batch_btn.click(
+        fn=batch_process_fn,
+        inputs=[folder_box, batch_out_dir, batch_want_layers, state_lang] + PARAM_COMPONENTS,
+        outputs=[batch_status],
     )
 
     # ── Local ROI preview ─────────────────────────────────────
@@ -2545,14 +3154,19 @@ with gr.Blocks(
     )
 
     # ── Language radio ──────────────────────────────────────────
-    def lang_radio_change(radio_val, is_focused):
+    def lang_radio_change(radio_val, is_focused, load_status_val, cfg_status_val, preview_status_val, compare_html_val,
+                           snap_a_status_val, snap_b_status_val, snap_c_status_val):
         lang = "zh" if radio_val == "中文" else "en"
-        return make_change_lang(lang)(is_focused)
+        return make_change_lang(lang)(is_focused, load_status_val, cfg_status_val, preview_status_val, compare_html_val,
+                                       snap_a_status_val, snap_b_status_val, snap_c_status_val)
 
     lang_radio.change(
         fn=lang_radio_change,
-        inputs=[lang_radio, focus_mode],
+        inputs=[lang_radio, focus_mode, load_status, cfg_status, preview_status, compare_slider_html,
+                snap_a_status, snap_b_status, snap_c_status],
         outputs=[state_lang] + [comp for comp, _ in TRANSLATED_COMPONENTS_MAP]
+                + [load_status, cfg_status, preview_status, compare_slider_html,
+                   snap_a_status, snap_b_status, snap_c_status]
     ).then(
         fn=get_status_bar_html,
         inputs=[state_lang],
