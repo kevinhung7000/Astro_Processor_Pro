@@ -41,7 +41,7 @@ Candidate improvements for the next release, in suggested priority order. Not a 
 
 ### Low priority
 
-- **~~ML-based denoising~~ ✅ Done (implemented)** — quality mode (v1.1.0) was Non-local Means, not a learned denoiser. A real ML option (e.g. a small pretrained model) would help with noisier subs, but has real costs: a noticeably larger installer, a new inference dependency, and slow CPU-only performance for users without a GPU. Worth scoping only after the above are done.
+- **~~ML-based denoising~~ ✅ Done（v1.2.0） (implemented)** — quality mode (v1.1.0) was Non-local Means, not a learned denoiser. A real ML option (e.g. a small pretrained model) would help with noisier subs, but has real costs: a noticeably larger installer, a new inference dependency, and slow CPU-only performance for users without a GPU. Worth scoping only after the above are done.
   - *Effort*: high (originally) — model selection, packaging size/dependency tradeoffs, and a CPU fallback story all need deciding before writing any code.
   - > **Code review note**: `AstroProcessorPro_Setup.iss` already notes the installer bundles `torch` for GPU-accelerated background estimation. If the shipped build already includes torch, the incremental dependency cost for an ML denoiser is mainly model weight size, not an additional runtime dependency. Confirm the distributed build variant before re-scoping priority.
   - > **Implementation note (implemented)**: Implemented the "方案 A: 外部工具介接" path and integrated it into the pipeline and UI. Core changes:
@@ -95,7 +95,7 @@ As with the main roadmap, this is a direction, not a commitment — open to reor
 
 ### 低優先
 
-- **~~ML 降噪~~ ✅ 已完成（已實作）** — quality 模式（v1.1.0）目前是 Non-local Means，不是學習式降噪。真正的 ML 選項（例如小型預訓練模型）對噪訊較重的疊圖會有幫助，但代價也真實存在：安裝檔會明顯變大、多一個推論相依套件、沒有 GPU 的使用者純 CPU 跑會很慢。建議在前面項目完成後再進一步評估。
+- **~~ML 降噪~~ ✅ 已完成（v1.2.0）（已實作）** — quality 模式（v1.1.0）目前是 Non-local Means，不是學習式降噪。真正的 ML 選項（例如小型預訓練模型）對噪訊較重的疊圖會有幫助，但代價也真實存在：安裝檔會明顯變大、多一個推論相依套件、沒有 GPU 的使用者純 CPU 跑會很慢。建議在前面項目完成後再進一步評估。
   - *工作量*：原先估為高 — 模型選型、封裝大小/相依套件取捨、以及無 GPU 時的退路方案，都需先決定。
   - > **複核備註**：`AstroProcessorPro_Setup.iss` 已註明安裝檔為了 GPU 背景估計加速而可能包含 `torch`。如果發行版本來就含 `torch`，那麼新增 ML 降噪的增量成本主要是權重檔案大小，而非新相依套件。請先確認實際出貨版本再調整優先度。
   - > **實作備註（已實作）**：已將「方案 A：外部工具介接」實際寫入 `Astro_Processor_Pro.py` 並整合到 UI 與參數設定中。主要改動：
