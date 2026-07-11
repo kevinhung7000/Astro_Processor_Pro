@@ -2389,7 +2389,8 @@ with gr.Blocks(
                         btn_label = "⛶ 專注預覽" if lang == "zh" else "⛶ Focus Preview"
                     updates.append(gr.update(value=btn_label))
                 elif key in ["scan_btn", "load_btn", "cfg_export_btn", "reset_btn",
-                             "layer_preview_btn", "export_btn", "monitor_refresh_btn"]:
+                             "layer_preview_btn", "export_btn", "monitor_refresh_btn",
+                             "local_preview_btn"]:
                     updates.append(gr.update(value=label_txt))
                 elif key in ["cfg_header_md", "layer_hint_md", "local_hint_md"]:
                     updates.append(gr.update(value=label_txt))
