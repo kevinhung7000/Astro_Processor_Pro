@@ -34,10 +34,11 @@ An interactive, high-performance astro-imaging post-processing application built
 - **🎯 Auto Localized Stretch**: Automatically detects textured regions (nebulosity, galaxy structure) via local-contrast analysis and boosts contrast only there, leaving the flat sky background untouched. A mask preview shows exactly what got detected and how strongly. An optional manual region (rectangle or ellipse, with adjustable feathering and boost weight) lets you override or supplement auto-detection for a target it missed.
 - **🎨 Presets & Snapshots**: One-click "Milky Way" / "Nebula" / "Heavy Light Pollution" starting points for beginners, plus named Snapshot A/B/C slots that can be saved to and loaded from files, so a favorite setup survives a page refresh.
 - **📁 Batch Processing**: Apply the current parameter set to every image in a folder in one go, with per-file progress, elapsed time, and a running ETA, plus a success/failure summary.
-- **🔌 External ML Tool Integration**: Denoise and star removal both support an "external" mode that shells out to a command-line tool you've installed and licensed yourself (e.g. DeepSNR, RC-Astro NoiseXTerminator/StarXTerminator CLI) instead of the built-in algorithms — the app never bundles or redistributes any third-party model.
+- **🔌 External ML Tool Integration**: Denoise and star removal both support an "external" mode that shells out to a command-line tool you've installed and licensed yourself (e.g. DeepSNR, RC-Astro NoiseXTerminator/StarXTerminator CLI, GraXpert) instead of the built-in algorithms — the app never bundles or redistributes any third-party model. Built-in tool presets auto-fill the correct CLI syntax for supported tools (still editable by hand), and tools that append their own file extension (like GraXpert) are supported via an `{output_noext}` placeholder.
+- **⏸️ Pausable Live Preview**: Toggle live preview on/off — useful when adjusting several parameters in a row, or in external mode where every preview update would otherwise re-invoke the external tool.
 - **💾 Full-Resolution Export**: Outputs high-quality JPEG and 16-bit TIFF files, with option to save independent Star Mask and Starless layers.
 - **⚙️ Config Backup & Restore**: Export and import your parameters as `.json` files.
-- **🖥️ Live System Monitor**: Keep track of CPU, RAM, and GPU VRAM usage right from the UI.
+- **🖥️ Live System Monitor**: Keep track of CPU, RAM, and GPU VRAM usage right from the UI, with an auto-refreshing readout (togglable) and an explicit status message for AMD/Intel (DirectML) GPUs, where live usage/VRAM numbers aren't available the way they are for NVIDIA.
 
 ---
 
@@ -155,10 +156,11 @@ An [Inno Setup](https://jrsoftware.org/isdl.php) script (`AstroProcessorPro_Setu
 - **🎯 自動局部拉伸**：透過局部對比分析自動偵測有結構的區域（星雲、銀河塵埃帶等），只加強該處對比，天空背景幾乎不受影響。內建遮罩預覽圖，可實際看到偵測到哪裡、加強力道多少。也支援選填的手動框選區域（矩形或橢圓，邊緣羽化與加強權重皆可調），用來覆蓋或補足自動偵測漏掉的目標。
 - **🎨 預設集與快照**：一鍵套用「銀河模式」「星雲模式」「重光害」等新手起手式，並提供具名的快照 A/B/C 插槽，可存成檔案、也能從檔案載入，讓常用組合不會因重新整理頁面而消失。
 - **📁 批次處理**：一次將目前參數套用到整個資料夾內的所有圖片，逐張顯示進度、耗時與即時 ETA，並於結束後給出成功/失敗摘要。
-- **🔌 外部 ML 工具介接**：降噪與去星都支援 "external" 模式，可改呼叫使用者自行安裝、自行取得授權的命令列工具（例如 DeepSNR、RC-Astro NoiseXTerminator/StarXTerminator CLI），取代內建演算法——程式本身完全不內建、不重新散布任何第三方模型。
+- **🔌 外部 ML 工具介接**：降噪與去星都支援 "external" 模式，可改呼叫使用者自行安裝、自行取得授權的命令列工具（例如 DeepSNR、RC-Astro NoiseXTerminator/StarXTerminator CLI、GraXpert），取代內建演算法——程式本身完全不內建、不重新散布任何第三方模型。內建工具範本可自動帶入對應的 CLI 語法（仍可手動調整），會自己補副檔名的工具（如 GraXpert）則透過 `{output_noext}` 佔位符支援。
+- **⏸️ 可暫停的即時預覽**：可切換即時預覽開關——適合連續調整多個參數，或使用 external 模式時避免每次更新都重複呼叫外部工具。
 - **💾 高解析度匯出**：一鍵匯出高品質 JPEG 與 16-bit 無損 TIFF。可選額外輸出「星點遮罩」與「去星背景圖層」供後續手動疊圖。
 - **⚙️ 參數備份與還原**：支援將當前調圖參數匯出為 `.json` 檔案備份，並能隨時載入復原。
-- **🖥️ 實時系統監控**：介面內建 CPU、記憶體與 GPU 顯存 (VRAM) 使用率監控。
+- **🖥️ 實時系統監控**：介面內建 CPU、記憶體與 GPU 顯存 (VRAM) 使用率監控，支援自動刷新（可關閉），AMD/Intel（DirectML）顯示卡會顯示明確的狀態訊息，取代原本讀不到即時數字時的空白區塊。
 
 ---
 
