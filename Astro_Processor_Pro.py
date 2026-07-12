@@ -43,6 +43,7 @@ import time
 import subprocess
 import tempfile
 import shlex
+import glob
 
 # --- PyInstaller --noconsole 修正：無終端機時 sys.stdout/stderr 為 None ---
 # uvicorn 的 logging 設定會呼叫 stream.isatty()，None 沒有這個方法會直接崩潰，
@@ -661,9 +662,16 @@ def run_external_image_tool(img01, exe_path, extra_args, timeout=_EXTERNAL_TOOL_
 
     img01: float32 [0,1] RGB numpy 陣列 (H, W, 3)。
     exe_path: 使用者在設定欄位指定的外部工具執行檔路徑（使用者自行安裝/授權）。
-    extra_args: 額外命令列參數字串。若包含 {input} / {output} 佔位符，會替換成
-        實際暫存檔路徑；若未包含，則相容「exe [options] <輸入檔> <輸出檔>」這種
-        多數 CLI 常見慣例，自動把輸入/輸出檔路徑附加在參數字串最後。
+    extra_args: 額外命令列參數字串。支援三種佔位符：
+        {input}        → 輸入暫存檔完整路徑（含副檔名 .tif）
+        {output}       → 輸出暫存檔完整路徑（含副檔名 .tif），呼叫端假設工具會
+                          原封不動寫到這個路徑
+        {output_noext} → 輸出暫存檔路徑，但「不含副檔名」——給像 GraXpert 這種
+                          自己決定輸出副檔名的工具用。用了這個佔位符時，本函式
+                          事後會用 glob 搜尋 tmp_dir 底下實際被寫出的檔案，而不是
+                          死板檢查單一固定路徑。
+        若三種佔位符都沒出現在 extra_args 裡，則相容「exe [options] <輸入檔> <輸出檔>」
+        這種多數 CLI 常見慣例，自動把輸入/輸出檔路徑（完整路徑）附加在參數字串最後。
 
     回傳 (out_img01, error_message)：
         成功時 error_message 為 None；失敗時 out_img01 為 None，error_message
@@ -679,6 +687,8 @@ def run_external_image_tool(img01, exe_path, extra_args, timeout=_EXTERNAL_TOOL_
     tmp_dir = tempfile.mkdtemp(prefix="astro_ext_")
     in_path = os.path.join(tmp_dir, "input.tif")
     out_path = os.path.join(tmp_dir, "output.tif")
+    out_stem = os.path.join(tmp_dir, "output")  # 給 {output_noext} 用，工具自己補副檔名
+    used_output_noext = False
     try:
         # 寫成 16-bit TIFF 暫存檔，避免先損失動態範圍再交給外部工具處理
         img16 = (np.clip(img01, 0, 1) * 65535.0).astype(np.uint16)
@@ -689,8 +699,12 @@ def run_external_image_tool(img01, exe_path, extra_args, timeout=_EXTERNAL_TOOL_
         except ValueError as e:
             return None, f"額外命令列參數格式錯誤：{e}"
 
-        if any(("{input}" in t) or ("{output}" in t) for t in arg_tokens):
-            arg_tokens = [t.replace("{input}", in_path).replace("{output}", out_path) for t in arg_tokens]
+        used_output_noext = any("{output_noext}" in t for t in arg_tokens)
+        if used_output_noext or any(("{input}" in t) or ("{output}" in t) for t in arg_tokens):
+            arg_tokens = [
+                t.replace("{output_noext}", out_stem).replace("{output}", out_path).replace("{input}", in_path)
+                for t in arg_tokens
+            ]
             cmd = [exe_path] + arg_tokens
         else:
             cmd = [exe_path] + arg_tokens + [in_path, out_path]
@@ -709,13 +723,29 @@ def run_external_image_tool(img01, exe_path, extra_args, timeout=_EXTERNAL_TOOL_
             extra = f"：{stderr_tail}" if stderr_tail else ""
             return None, f"外部工具回傳非 0 錯誤代碼 ({result.returncode}){extra}"
 
-        if not os.path.isfile(out_path):
-            return None, "外部工具執行完畢，但找不到輸出檔案，請確認額外參數設定是否正確"
+        if used_output_noext:
+            # 工具自己決定副檔名，用檔名主體 glob 搜尋實際寫出的檔案
+            candidates = [f for f in glob.glob(out_stem + ".*") if os.path.isfile(f)]
+            if not candidates:
+                return None, "外部工具執行完畢，但找不到輸出檔案（已用 {output_noext} 搜尋對應副檔名），請確認額外參數設定是否正確"
+            candidates.sort(key=os.path.getmtime, reverse=True)
+            actual_out_path = candidates[0]
+        else:
+            if not os.path.isfile(out_path):
+                return None, "外部工具執行完畢，但找不到輸出檔案，請確認額外參數設定是否正確"
+            actual_out_path = out_path
 
         try:
-            out16 = tifffile.imread(out_path)
-        except Exception as e:
-            return None, f"讀取外部工具輸出檔失敗：{e}"
+            out16 = tifffile.imread(actual_out_path)
+        except Exception:
+            # 有些工具搭配 {output_noext} 時可能吐出非 TIFF 格式，退而用一般影像讀取
+            try:
+                out16_bgr = cv2.imread(actual_out_path, cv2.IMREAD_UNCHANGED)
+                if out16_bgr is None:
+                    raise ValueError("cv2.imread 回傳 None")
+                out16 = out16_bgr[:, :, ::-1] if out16_bgr.ndim == 3 else out16_bgr
+            except Exception as e2:
+                return None, f"讀取外部工具輸出檔失敗：{e2}"
 
         if out16.ndim == 2:
             out16 = np.stack([out16] * 3, axis=-1)
@@ -734,7 +764,10 @@ def run_external_image_tool(img01, exe_path, extra_args, timeout=_EXTERNAL_TOOL_
 
         return np.clip(out01, 0.0, 1.0).astype(np.float32), None
     finally:
-        for f in (in_path, out_path):
+        cleanup_targets = [in_path, out_path]
+        if used_output_noext:
+            cleanup_targets += glob.glob(out_stem + ".*")
+        for f in cleanup_targets:
             try:
                 if os.path.isfile(f):
                     os.remove(f)
@@ -744,6 +777,36 @@ def run_external_image_tool(img01, exe_path, extra_args, timeout=_EXTERNAL_TOOL_
             os.rmdir(tmp_dir)
         except OSError:
             pass
+
+
+# ── v1.2.1 主線 A：外部工具範本對照表 ─────────────────────────
+# 純 UI 便利性用途：選了範本，自動把對應「額外命令列參數」字串帶進欄位，
+# 不需要使用者自己記或手打各家工具的 CLI 語法。不影響 run_external_image_tool()
+# 本身的呼叫邏輯，也不會被寫進 PARAM_NAMES/DEFAULTS（純粹是填欄位用的捷徑，
+# 不是需要跟著參數快照/設定檔一起保存的處理參數）。
+#
+# 語法查證狀態（撰寫時）：
+#   DeepSNR                    — ✅ 使用者實機驗證成功（-i/-o 短旗標 + -m 模型版本 +
+#     -s stride；-m/-s 沒有固定「正確答案」，依圖片內容/硬體可能需要自行調整，
+#     這裡的 2 / 32 是目前驗證過可用的組合，不代表官方建議預設值）
+#   RC-Astro NoiseXTerminator/  — 語法已對照官方文件確認，尚未在有效授權下實測
+#     StarXTerminator
+#   GraXpert                   — 語法已對照官方文件確認，尚未實測；{output_noext}
+#     機制是為了它專門加的
+#   StarNet（舊版，位置參數）    — 舊版 CLI 已知是位置參數，跟通用退路慣例本來就
+#     相容，範本留空即可；StarNet2 新版旗標尚未查證，故不列入下拉選單
+EXTERNAL_TOOL_PROFILES_DENOISE = {
+    "自訂 / Custom": "",
+    "DeepSNR": "-i {input} -o {output} -m 2 -s 32",
+    "RC-Astro NoiseXTerminator": "nxt {input} --output {output} --overwrite",
+    "GraXpert": "-cli -cmd denoising {input} -output {output_noext}",
+}
+
+EXTERNAL_TOOL_PROFILES_STAR = {
+    "自訂 / Custom": "",
+    "RC-Astro StarXTerminator": "sxt {input} --output {output} --overwrite",
+    "StarNet（舊版，位置參數）/ Legacy, Positional Args": "",
+}
 
 
 def denoise(img8, enable, mode, d, sigma_color, sigma_space, nlm_h, nlm_h_color,
@@ -1671,7 +1734,11 @@ def load_image_fn(folder, filename, uploaded, preview_max, lang="zh"):
         return None, None, 1.0, status, gr.update(), None, None, None
 
 
-def update_preview_fn(preview_base, preview_scale, full_img, use_full_res, lang, *param_values):
+def update_preview_fn(preview_base, preview_scale, full_img, use_full_res, live_preview_enabled, lang, *param_values):
+    if not live_preview_enabled:
+        # v1.2.1 主線 A：暫停即時預覽——全部輸出回傳 no-op，畫面停留在暫停前的結果，
+        # 也完全不會走到下面的 run_pipeline（包含 mode="external" 的外部工具呼叫）。
+        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
     use_full = bool(use_full_res) and full_img is not None
     img_to_use = full_img if use_full else preview_base
     scale_to_use = 1.0 if use_full else preview_scale
@@ -1964,6 +2031,17 @@ UI_TRANSLATIONS = {
         "zh": ("即時預覽改用原圖全解析度運算(較慢但最準確)", "未勾選時使用縮圖運算，速度較快；勾選後直接用原圖跑全部流程"),
         "en": ("Use Full Resolution for Live Preview (Slower but accurate)", "When unchecked, uses a downscaled thumbnail for speed; when checked, runs the full pipeline on the original image"),
     },
+    "live_preview_enabled": {
+        "zh": ("即時預覽（取消勾選可暫停自動重算）",
+               "暫停後，調整滑桿/開關不會立即重新運算，畫面停留在暫停前的結果；"
+               "適合連續調整多個參數、或使用 external 模式時避免重複呼叫外部工具。"
+               "重新勾選會立刻用目前參數更新一次。"),
+        "en": ("Live Preview (Uncheck to Pause Auto-Recompute)",
+               "When paused, adjusting sliders/toggles won't trigger an immediate recompute — the view stays "
+               "on the result from before pausing. Useful when tweaking several parameters in a row, or with "
+               "external mode to avoid repeatedly calling the external tool. Re-checking refreshes immediately "
+               "with the current parameters."),
+    },
     "load_btn": {"zh": "📥 載入圖片", "en": "📥 Load Image"},
     "cfg_export_btn": {"zh": "📤 匯出當前參數", "en": "📤 Export Current Parameters"},
     "cfg_import_file": {"zh": "匯入參數 JSON", "en": "Import Config JSON"},
@@ -2067,7 +2145,10 @@ UI_TRANSLATIONS = {
         "zh": ("飽和度倍率", "銀河/星雲通常需 1.2-1.8 倍增益"),
         "en": ("Saturation Boost Factor", "Milky Way/nebula shots typically need a 1.2-1.8x boost"),
     },
-    "bright_boost": {"zh": "明度倍率", "en": "Brightness Boost Factor"},
+    "bright_boost": {
+        "zh": ("明度倍率", "整體亮度微調，通常接近 1.0 即可，避免過曝"),
+        "en": ("Brightness Boost Factor", "Fine-tunes overall brightness; keep close to 1.0 to avoid overexposure"),
+    },
     "r_gain": {
         "zh": ("🔴 紅色通道增益", "加強發射星雲 H-alpha 訊號"),
         "en": ("🔴 Red Gain", "Boosts emission nebula H-alpha signal"),
@@ -2088,7 +2169,10 @@ UI_TRANSLATIONS = {
         "zh": ("Clarity 強度", "類似 Lightroom 清晰度"),
         "en": ("Clarity Strength", "Similar to Lightroom's Clarity"),
     },
-    "sharpen_blur": {"zh": "銳化模糊半徑", "en": "Sharpen Blur Radius"},
+    "sharpen_blur": {
+        "zh": ("銳化模糊半徑", "決定銳化鎖定的細節尺度，越大銳化範圍越粗"),
+        "en": ("Sharpen Blur Radius", "Sets the detail scale that sharpening targets; larger values give coarser sharpening"),
+    },
     "sharpen_amount": {
         "zh": ("銳化程度", "過大會使雜訊粒子變粗"),
         "en": ("Sharpen Amount", "Too high will make noise grain coarser"),
@@ -2109,21 +2193,41 @@ UI_TRANSLATIONS = {
                "models — licensing responsibility stays with the user. If the executable is missing or the "
                "call fails, this step is skipped and the unprocessed image is returned; the pipeline is not interrupted."),
     },
+    "denoise_ext_profile": {
+        "zh": ("[external]工具範本（自動帶入下方參數）",
+               "選了範本會自動把對應語法填進「額外命令列參數」欄位，仍可手動再調整；"
+               "例如 DeepSNR 範本裡的 -m/-s 數值可依圖片內容自行微調。"
+               "語法查證狀態請參考優化計畫文件，尚未實測的範本可能需要自行微調。"),
+        "en": ("[external] Tool Preset (auto-fills the field below)",
+               "Selecting a preset auto-fills the matching syntax into \"Extra Command-line Arguments\"; "
+               "you can still edit it manually afterward — e.g. the DeepSNR preset's -m/-s values may need "
+               "tuning depending on the image. See the optimization plan document for each preset's "
+               "verification status; presets not yet field-tested may need adjustment."),
+    },
     "denoise_ext_args": {
-        "zh": ("[external]額外命令列參數", "可用 {input} / {output} 佔位符；留空則預設為「執行檔 輸入檔 輸出檔」"),
-        "en": ("[external] Extra Command-line Arguments", "Use {input} / {output} placeholders; if left blank, defaults to \"executable input_file output_file\""),
+        "zh": ("[external]額外命令列參數", "可用 {input} / {output} / {output_noext} 佔位符；留空則預設為「執行檔 輸入檔 輸出檔」"),
+        "en": ("[external] Extra Command-line Arguments", "Use {input} / {output} / {output_noext} placeholders; if left blank, defaults to \"executable input_file output_file\""),
     },
     "denoise_d": {
         "zh": ("[fast]濾波視窗", "較大數值降噪範圍廣但耗時"),
         "en": ("[fast] Bilateral Filter Diameter (d)", "Larger values denoise a wider area but take longer"),
     },
-    "denoise_sigma_color": {"zh": "[fast]顏色 Sigma", "en": "[fast] Denoise Sigma Color"},
-    "denoise_sigma_space": {"zh": "[fast]空間 Sigma", "en": "[fast] Denoise Sigma Space"},
+    "denoise_sigma_color": {
+        "zh": ("[fast]顏色 Sigma", "越高越能融合差異較大的顏色，但可能糊掉色彩邊界"),
+        "en": ("[fast] Denoise Sigma Color", "Higher values blend more dissimilar colors together, but may blur color boundaries"),
+    },
+    "denoise_sigma_space": {
+        "zh": ("[fast]空間 Sigma", "越高影響範圍越大的鄰近像素，降噪更平滑但更慢"),
+        "en": ("[fast] Denoise Sigma Space", "Higher values affect a wider neighborhood of pixels — smoother denoising but slower"),
+    },
     "denoise_nlm_h": {
         "zh": ("[quality]亮度降噪強度 h", "越高越乾淨，但可能抹掉細節"),
         "en": ("[quality] Luminance Denoise Strength (h)", "Higher = cleaner but may erase detail"),
     },
-    "denoise_nlm_h_color": {"zh": "[quality]色彩降噪強度 hColor", "en": "[quality] Color Denoise Strength (hColor)"},
+    "denoise_nlm_h_color": {
+        "zh": ("[quality]色彩降噪強度 hColor", "越高色彩雜訊越乾淨，但可能造成色塊化"),
+        "en": ("[quality] Color Denoise Strength (hColor)", "Higher values give cleaner color noise removal, but may cause color blotching"),
+    },
     "star_mode": {
         "zh": ("模式", "external=呼叫外部 ML 去星工具(見下方設定)"),
         "en": ("Star Processing Mode", "external = calls an external ML star-removal tool (see settings below)"),
@@ -2139,9 +2243,18 @@ UI_TRANSLATIONS = {
                "models — licensing responsibility stays with the user. If the executable is missing or the "
                "call fails, this step is skipped and the unprocessed image is returned; the pipeline is not interrupted."),
     },
+    "star_ext_profile": {
+        "zh": ("[external]工具範本（自動帶入下方參數）",
+               "選了範本會自動把對應語法填進「額外命令列參數」欄位，仍可手動再調整；"
+               "語法查證狀態請參考優化計畫文件，尚未實測的範本可能需要自行微調。"),
+        "en": ("[external] Tool Preset (auto-fills the field below)",
+               "Selecting a preset auto-fills the matching syntax into \"Extra Command-line Arguments\"; "
+               "you can still edit it manually afterward. See the optimization plan document for each "
+               "preset's verification status; presets not yet field-tested may need adjustment."),
+    },
     "star_ext_args": {
-        "zh": ("[external]額外命令列參數", "可用 {input} / {output} 佔位符；留空則預設為「執行檔 輸入檔 輸出檔」"),
-        "en": ("[external] Extra Command-line Arguments", "Use {input} / {output} placeholders; if left blank, defaults to \"executable input_file output_file\""),
+        "zh": ("[external]額外命令列參數", "可用 {input} / {output} / {output_noext} 佔位符；留空則預設為「執行檔 輸入檔 輸出檔」"),
+        "en": ("[external] Extra Command-line Arguments", "Use {input} / {output} / {output_noext} placeholders; if left blank, defaults to \"executable input_file output_file\""),
     },
     "star_kernel": {
         "zh": ("偵測核大小(≈星點直徑px)", "應略大於想抓取的中小型星點直徑"),
@@ -2151,31 +2264,79 @@ UI_TRANSLATIONS = {
         "zh": ("偵測門檻", "越低暗星越多，過低會誤抓背景熱雜訊"),
         "en": ("Star Detection Threshold", "Lower = more faint stars detected; too low will pick up background hot-pixel noise"),
     },
-    "star_max_area": {"zh": "星點最大面積", "en": "Maximum Star Area (px²)"},
-    "star_max_area_large": {"zh": "亮星暈光面積上限", "en": "Maximum Bright Star Halo Area (px²)"},
+    "star_max_area": {
+        "zh": ("星點最大面積", "超過此面積的斑塊不視為一般星點，避免誤抓星雲亮核"),
+        "en": ("Maximum Star Area (px²)", "Blobs larger than this area are not treated as ordinary stars, to avoid mistakenly capturing bright nebula cores"),
+    },
+    "star_max_area_large": {
+        "zh": ("亮星暈光面積上限", "超過此面積直接排除，避免大範圍暈光被誤判為星點"),
+        "en": ("Maximum Bright Star Halo Area (px²)", "Blobs larger than this are excluded outright, to avoid large halos being misidentified as stars"),
+    },
     "star_aspect": {
         "zh": ("圓度門檻(長寬比)", "排除長條形星雲結構"),
         "en": ("Star Aspect Ratio Threshold", "Excludes elongated nebula structures"),
     },
-    "star_dilate": {"zh": "遮罩外擴基本像素", "en": "Mask Dilation Base px"},
-    "star_dilate_scale": {"zh": "依星點大小外擴比例", "en": "Mask Dilation Size-dependent Scale"},
-    "star_shrink_kernel": {"zh": "[縮星]侵蝕核大小", "en": "[Shrink] Erosion Kernel Size"},
-    "star_shrink_iter": {"zh": "[縮星]侵蝕次數", "en": "[Shrink] Erosion Iterations"},
-    "star_shrink_strength": {"zh": "[縮星]套用強度", "en": "[Shrink] Apply Strength"},
-    "star_inpaint_radius": {"zh": "[去星]單星取樣半徑", "en": "[Remove] Inpaint Radius (px)"},
-    "star_feather_px": {"zh": "[去星]邊緣羽化程度", "en": "[Remove] Edge Feathering px"},
+    "star_dilate": {
+        "zh": ("遮罩外擴基本像素", "每個星點遮罩固定外擴的像素數，確保完整覆蓋星點邊緣"),
+        "en": ("Mask Dilation Base px", "Fixed number of pixels each star mask is expanded by, to fully cover star edges"),
+    },
+    "star_dilate_scale": {
+        "zh": ("依星點大小外擴比例", "星點越大外擴越多，避免大星周圍殘留光暈"),
+        "en": ("Mask Dilation Size-dependent Scale", "Larger stars are expanded proportionally more, to avoid leftover halos around bright stars"),
+    },
+    "star_shrink_kernel": {
+        "zh": ("[縮星]侵蝕核大小", "每次侵蝕使用的核心大小，越大縮星效果越明顯"),
+        "en": ("[Shrink] Erosion Kernel Size", "Kernel size used per erosion pass; larger values give a stronger shrink effect"),
+    },
+    "star_shrink_iter": {
+        "zh": ("[縮星]侵蝕次數", "重複侵蝕的次數，越多星點縮得越小"),
+        "en": ("[Shrink] Erosion Iterations", "Number of erosion passes; more passes shrink stars further"),
+    },
+    "star_shrink_strength": {
+        "zh": ("[縮星]套用強度", "0 為不縮星，1 為完全套用侵蝕結果"),
+        "en": ("[Shrink] Apply Strength", "0 = no shrinking, 1 = fully apply the erosion result"),
+    },
+    "star_inpaint_radius": {
+        "zh": ("[去星]單星取樣半徑", "從星點周圍多遠的範圍取樣來填補去星後的背景"),
+        "en": ("[Remove] Inpaint Radius (px)", "How far around each star to sample from when filling in the background after removal"),
+    },
+    "star_feather_px": {
+        "zh": ("[去星]邊緣羽化程度", "去星邊界的柔化寬度，越高過渡越自然但越模糊"),
+        "en": ("[Remove] Edge Feathering px", "Softening width at the star-removal boundary; higher values blend more naturally but look blurrier"),
+    },
     "star_noise_strength": {
         "zh": ("[去星]雜訊回填強度", "0 為不回填"),
         "en": ("[Remove] Noise Infill Strength", "0 = no noise infill"),
     },
     "multiscale_enable": {"zh": "啟用大範圍偵測", "en": "Enable Multi-scale Star Detection"},
-    "cluster_kernel": {"zh": "偵測核大小", "en": "Cluster Detection Kernel Size"},
-    "cluster_thresh": {"zh": "偵測門檻", "en": "Cluster Detection Threshold"},
-    "cluster_min_area": {"zh": "最小面積", "en": "Minimum Cluster Area (px²)"},
-    "cluster_max_area": {"zh": "最大面積", "en": "Maximum Cluster Area (px²)"},
-    "cluster_aspect": {"zh": "長寬比門檻", "en": "Cluster Aspect Ratio Threshold"},
-    "cluster_dilate": {"zh": "遮罩外擴像素", "en": "Cluster Mask Dilation px"},
-    "cluster_inpaint_radius": {"zh": "[去星]星團取樣半徑", "en": "[Remove] Cluster Inpaint Radius"},
+    "cluster_kernel": {
+        "zh": ("偵測核大小", "用來偵測大範圍密集星團的局部視窗，應大於一般星點"),
+        "en": ("Cluster Detection Kernel Size", "Local window used to detect large, dense star clusters; should be larger than a typical star"),
+    },
+    "cluster_thresh": {
+        "zh": ("偵測門檻", "越低越容易把稀疏星群也判定為星團"),
+        "en": ("Cluster Detection Threshold", "Lower values make sparse star groups more likely to be classified as clusters"),
+    },
+    "cluster_min_area": {
+        "zh": ("最小面積", "小於此面積不視為星團，避免與一般星點混淆"),
+        "en": ("Minimum Cluster Area (px²)", "Blobs smaller than this area are not treated as clusters, to avoid confusion with ordinary stars"),
+    },
+    "cluster_max_area": {
+        "zh": ("最大面積", "超過此面積可能是星雲亮區而非星團，會被排除"),
+        "en": ("Maximum Cluster Area (px²)", "Blobs larger than this may be bright nebula regions rather than clusters, and are excluded"),
+    },
+    "cluster_aspect": {
+        "zh": ("長寬比門檻", "排除過於狹長的區域，避免誤抓塵埃帶或條紋雜訊"),
+        "en": ("Cluster Aspect Ratio Threshold", "Excludes overly elongated regions, to avoid mistakenly capturing dust lanes or streak noise"),
+    },
+    "cluster_dilate": {
+        "zh": ("遮罩外擴像素", "星團遮罩外擴的像素數，確保完整覆蓋週邊暗星"),
+        "en": ("Cluster Mask Dilation px", "Number of pixels the cluster mask is expanded by, to fully cover surrounding faint stars"),
+    },
+    "cluster_inpaint_radius": {
+        "zh": ("[去星]星團取樣半徑", "去除星團時，從多遠範圍取樣填補背景"),
+        "en": ("[Remove] Cluster Inpaint Radius", "How far around each cluster to sample from when filling in the background during removal"),
+    },
     "reset_btn": {"zh": "↩️ 重設為預設值", "en": "↩️ Reset to Default Values"},
     "original_preview_image": {"zh": "原圖(未處理)", "en": "Original (Unprocessed)"},
     "preview_image": {"zh": "即時預覽效果(處理後)", "en": "Live Preview (Processed)"},
@@ -2194,6 +2355,10 @@ UI_TRANSLATIONS = {
     "preview_hist": {"zh": "RGB 通道分佈曲線", "en": "RGB Channel Histogram"},
     "mask_mini": {"zh": "星點遮罩(產生圖層後自動更新)", "en": "Star Mask (Auto updates after generating layers)"},
     "monitor_refresh_btn": {"zh": "🔄 更新監控資訊", "en": "🔄 Update System Monitor Info"},
+    "monitor_auto_refresh": {
+        "zh": ("自動刷新(每 3 秒)", "關閉後僅能用左邊按鈕手動刷新，適合想完全避免背景輪詢的情境（如共用電腦、省電）。"),
+        "en": ("Auto-refresh (every 3s)", "When off, only the button on the left will refresh the stats — useful when you want to avoid background polling entirely (e.g. shared computers, power saving)."),
+    },
     "tab_load": {"zh": "📂 選圖 & 設定", "en": "📂 Image & Config"},
     "tab_param": {"zh": "⚙️ 參數調整", "en": "⚙️ Parameters"},
     "acc_bg": {"zh": "1️⃣ 背景漸層去除(去光害/朦朧)", "en": "1️⃣ Background Gradient Removal"},
@@ -2219,9 +2384,18 @@ UI_TRANSLATIONS = {
         "en": ("Compare Mode", "'Slider Overlay': drag handle to compare before/after on same view; 'Side by Side': show both images"),
     },
     "tab_local": {"zh": "⚡ 局部預覽", "en": "⚡ Local Preview"},
-    "local_x_pct": {"zh": "X 中心位置 (%)", "en": "X Center (%)"},
-    "local_y_pct": {"zh": "Y 中心位置 (%)", "en": "Y Center (%)"},
-    "local_crop_px": {"zh": "裁切大小 (px)", "en": "Crop Size (px)"},
+    "local_x_pct": {
+        "zh": ("X 中心位置 (%)", "裁切區域中心點的水平位置，以整張圖寬度的百分比表示"),
+        "en": ("X Center (%)", "Horizontal position of the crop region's center, as a percentage of the full image width"),
+    },
+    "local_y_pct": {
+        "zh": ("Y 中心位置 (%)", "裁切區域中心點的垂直位置，以整張圖高度的百分比表示"),
+        "en": ("Y Center (%)", "Vertical position of the crop region's center, as a percentage of the full image height"),
+    },
+    "local_crop_px": {
+        "zh": ("裁切大小 (px)", "裁切區域的邊長，越小處理越快但看到的範圍也越小"),
+        "en": ("Crop Size (px)", "Side length of the crop region; smaller = faster processing but a smaller visible area"),
+    },
     "local_preview_btn": {"zh": "⚡ 更新局部預覽", "en": "⚡ Update Local Preview"},
     "local_overview_img": {"zh": "裁切位置概覽（紅框=裁切區）", "en": "Crop Location Overview (Red box = crop region)"},
     "local_result_img": {"zh": "局部處理結果（全解析度品質）", "en": "Local Processed Result (Full-Res Quality)"},
@@ -2348,30 +2522,45 @@ def get_system_stats_html():
     else:
         rows.append("<div class='mon-hint'>🔧 pip install psutil</div>")
 
+    # v1.2.1 主線 B：GPU 區塊重寫，讓 DirectML(AMD/Intel) 使用者至少看到一句解釋，
+    # 而不是完全空白（原本 HAS_GPUTIL 為 True 但 getGPUs() 找不到 NVIDIA 顯卡時，
+    # 迴圈跑零次、什麼提示都不會顯示，看起來像程式壞掉）。
+    gpu_shown = False
     if HAS_GPUTIL:
         try:
-            for gpu in _GPUtil.getGPUs():
-                gpu_pct   = gpu.load * 100
-                vram_used  = gpu.memoryUsed  / 1024
-                vram_total = gpu.memoryTotal / 1024
-                vram_pct   = (gpu.memoryUsed / max(gpu.memoryTotal, 1)) * 100
-                rows.append(
-                    f'<div class="mon-row">'
-                    f'<span class="mon-label">GPU</span>'
-                    f'{_bar(gpu_pct, "gpu-bar")}'
-                    f'<span class="mon-val">{gpu_pct:.0f}%</span>'
-                    f'</div>'
-                )
-                rows.append(
-                    f'<div class="mon-row">'
-                    f'<span class="mon-label">VRAM</span>'
-                    f'{_bar(vram_pct, "vram-bar")}'
-                    f'<span class="mon-val">{vram_used:.1f}/{vram_total:.1f} GB</span>'
-                    f'</div>'
-                )
+            gpus = _GPUtil.getGPUs()
         except Exception:
-            pass
-    elif USE_GPU and HAS_TORCH:
+            gpus = []
+        for gpu in gpus:
+            gpu_pct   = gpu.load * 100
+            vram_used  = gpu.memoryUsed  / 1024
+            vram_total = gpu.memoryTotal / 1024
+            vram_pct   = (gpu.memoryUsed / max(gpu.memoryTotal, 1)) * 100
+            rows.append(
+                f'<div class="mon-row">'
+                f'<span class="mon-label">GPU</span>'
+                f'{_bar(gpu_pct, "gpu-bar")}'
+                f'<span class="mon-val">{gpu_pct:.0f}%</span>'
+                f'</div>'
+            )
+            rows.append(
+                f'<div class="mon-row">'
+                f'<span class="mon-label">VRAM</span>'
+                f'{_bar(vram_pct, "vram-bar")}'
+                f'<span class="mon-val">{vram_used:.1f}/{vram_total:.1f} GB</span>'
+                f'</div>'
+            )
+            gpu_shown = True
+
+    if not gpu_shown and USE_GPU and _IS_DIRECTML:
+        # GPUtil 底層包 nvidia-smi，只找得到 NVIDIA；DirectML(AMD/Intel/Windows GPU)
+        # 目前沒有跨廠牌的即時使用率/VRAM 讀取方式，先給一句誠實的說明取代空白區塊。
+        rows.append(
+            "<div class='mon-hint'>⚡ DirectML 加速中（此廠牌暫無法讀取即時使用率/VRAM）</div>"
+        )
+        gpu_shown = True
+
+    if not gpu_shown and USE_GPU and HAS_TORCH:
         try:
             import torch
             if torch.cuda.is_available():
@@ -2385,9 +2574,11 @@ def get_system_stats_html():
                     f'<span class="mon-val">{alloc:.1f}/{total_mem:.1f} GB</span>'
                     f'</div>'
                 )
+                gpu_shown = True
         except Exception:
             pass
-    else:
+
+    if not gpu_shown:
         rows.append("<div class='mon-hint'>🔧 pip install GPUtil</div>")
 
     return f'<div class="mon-panel">{"".join(rows)}</div>'
@@ -3095,10 +3286,21 @@ with gr.Blocks(
                                      "本程式不內建、不重新散布任何第三方模型，授權責任由使用者自行負責。找不到執行檔或呼叫失敗時，"
                                      "本步驟會自動跳過並回傳未降噪的原圖，不會中斷處理。",
                             )
+                            denoise_ext_profile = gr.Dropdown(
+                                choices=list(EXTERNAL_TOOL_PROFILES_DENOISE.keys()),
+                                value="自訂 / Custom",
+                                label=UI_TRANSLATIONS["denoise_ext_profile"]["zh"][0],
+                                info=UI_TRANSLATIONS["denoise_ext_profile"]["zh"][1],
+                            )
                             denoise_ext_args    = gr.Textbox(
                                 label="[external]額外命令列參數", value="",
-                                placeholder="可用 {input} / {output} 佔位符；留空則預設為「執行檔 輸入檔 輸出檔」",
-                                info="若外部工具的命令列語法不是單純的「輸入檔 輸出檔」，可在此用 {input}/{output} 自訂順序與其他參數。",
+                                placeholder="可用 {input} / {output} / {output_noext} 佔位符；留空則預設為「執行檔 輸入檔 輸出檔」",
+                                info="若外部工具的命令列語法不是單純的「輸入檔 輸出檔」，可在此用 {input}/{output} 自訂順序與其他參數；"
+                                     "若工具會自己補副檔名（如 GraXpert），改用 {output_noext}。",
+                            )
+                            denoise_ext_profile.change(
+                                fn=lambda name: EXTERNAL_TOOL_PROFILES_DENOISE.get(name, ""),
+                                inputs=[denoise_ext_profile], outputs=[denoise_ext_args],
                             )
 
                         with gr.Accordion("7️⃣ 星點縮小 / 去星", open=False) as acc_star:
@@ -3123,10 +3325,21 @@ with gr.Blocks(
                                      "本程式不內建、不重新散布任何第三方模型，授權責任由使用者自行負責。找不到執行檔或呼叫失敗時，"
                                      "本步驟會自動跳過並回傳未去星的原圖，不會中斷處理。",
                             )
+                            star_ext_profile    = gr.Dropdown(
+                                choices=list(EXTERNAL_TOOL_PROFILES_STAR.keys()),
+                                value="自訂 / Custom",
+                                label=UI_TRANSLATIONS["star_ext_profile"]["zh"][0],
+                                info=UI_TRANSLATIONS["star_ext_profile"]["zh"][1],
+                            )
                             star_ext_args       = gr.Textbox(
                                 label="[external]額外命令列參數", value="",
-                                placeholder="可用 {input} / {output} 佔位符；留空則預設為「執行檔 輸入檔 輸出檔」",
-                                info="若外部工具的命令列語法不是單純的「輸入檔 輸出檔」，可在此用 {input}/{output} 自訂順序與其他參數。",
+                                placeholder="可用 {input} / {output} / {output_noext} 佔位符；留空則預設為「執行檔 輸入檔 輸出檔」",
+                                info="若外部工具的命令列語法不是單純的「輸入檔 輸出檔」，可在此用 {input}/{output} 自訂順序與其他參數；"
+                                     "若工具會自己補副檔名，改用 {output_noext}。",
+                            )
+                            star_ext_profile.change(
+                                fn=lambda name: EXTERNAL_TOOL_PROFILES_STAR.get(name, ""),
+                                inputs=[star_ext_profile], outputs=[star_ext_args],
                             )
 
                         with gr.Accordion("7️⃣b 大範圍偵測(密集星團/大片暈光)", open=False) as acc_cluster:
@@ -3147,6 +3360,11 @@ with gr.Blocks(
 
                 # ── Tab: Live Preview ─────────────────────────
                 with gr.Tab("🖼️ 即時預覽") as tab_preview:
+                    live_preview_enabled = gr.Checkbox(
+                        value=True,
+                        label=UI_TRANSLATIONS["live_preview_enabled"]["zh"][0],
+                        info=UI_TRANSLATIONS["live_preview_enabled"]["zh"][1],
+                    )
                     compare_mode = gr.Radio(
                         choices=["並排顯示", "滑桿疊圖"],
                         value="並排顯示",
@@ -3257,7 +3475,13 @@ with gr.Blocks(
 
             with gr.Accordion("🖥️ 系統監控", open=True) as acc_monitor:
                 monitor_html        = gr.HTML(get_system_stats_html())
-                monitor_refresh_btn = gr.Button("🔄 更新監控資訊", size="sm")
+                with gr.Row():
+                    monitor_refresh_btn = gr.Button("🔄 更新監控資訊", size="sm")
+                    monitor_auto_refresh = gr.Checkbox(
+                        value=True, label=UI_TRANSLATIONS["monitor_auto_refresh"]["zh"][0], scale=0,
+                        info=UI_TRANSLATIONS["monitor_auto_refresh"]["zh"][1],
+                    )
+                monitor_timer = gr.Timer(3, active=True)
 
     # ── Bottom Status Bar ─────────────────────────────────────
     status_bar_out = gr.HTML(get_status_bar_html())
@@ -3306,7 +3530,7 @@ with gr.Blocks(
 
     # Preview common inputs / outputs
     _PREV_IN  = [state_preview_base, state_preview_scale, state_full,
-                 use_full_res_preview, state_lang] + PARAM_COMPONENTS
+                 use_full_res_preview, live_preview_enabled, state_lang] + PARAM_COMPONENTS
     _PREV_OUT = [preview_image, original_preview_image, preview_hist, preview_status, compare_slider_html]
 
 
@@ -3318,6 +3542,7 @@ with gr.Blocks(
         (upload_file, "upload_file"),
         (preview_size, "preview_size"),
         (use_full_res_preview, "use_full_res_preview"),
+        (live_preview_enabled, "live_preview_enabled"),
         (load_btn, "load_btn"),
         (cfg_export_btn, "cfg_export_btn"),
         (cfg_import_file, "cfg_import_file"),
@@ -3363,6 +3588,7 @@ with gr.Blocks(
         (denoise_nlm_h, "denoise_nlm_h"),
         (denoise_nlm_h_color, "denoise_nlm_h_color"),
         (denoise_ext_path, "denoise_ext_path"),
+        (denoise_ext_profile, "denoise_ext_profile"),
         (denoise_ext_args, "denoise_ext_args"),
         (star_mode, "star_mode"),
         (star_kernel, "star_kernel"),
@@ -3379,6 +3605,7 @@ with gr.Blocks(
         (star_feather_px, "star_feather_px"),
         (star_noise_strength, "star_noise_strength"),
         (star_ext_path, "star_ext_path"),
+        (star_ext_profile, "star_ext_profile"),
         (star_ext_args, "star_ext_args"),
         (multiscale_enable, "multiscale_enable"),
         (cluster_kernel, "cluster_kernel"),
@@ -3403,6 +3630,7 @@ with gr.Blocks(
         (preview_hist, "preview_hist"),
         (mask_mini, "mask_mini"),
         (monitor_refresh_btn, "monitor_refresh_btn"),
+        (monitor_auto_refresh, "monitor_auto_refresh"),
         (tab_load, "tab_load"),
         (tab_param, "tab_param"),
         (acc_bg, "acc_bg"),
@@ -3558,6 +3786,13 @@ with gr.Blocks(
 
     # ── Full-res toggle ───────────────────────────────────────
     use_full_res_preview.change(
+        fn=update_preview_fn, inputs=_PREV_IN, outputs=_PREV_OUT,
+    )
+
+    # ── Live preview pause/resume toggle（v1.2.1 主線 A）──────
+    # 關閉時 update_preview_fn 自己會 no-op；重新開啟時這裡會立刻補跑一次，
+    # 避免恢復後畫面停在暫停前的舊結果。
+    live_preview_enabled.change(
         fn=update_preview_fn, inputs=_PREV_IN, outputs=_PREV_OUT,
     )
 
@@ -3720,6 +3955,17 @@ with gr.Blocks(
     monitor_refresh_btn.click(
         fn=get_system_stats_html,
         outputs=[monitor_html],
+    )
+
+    # ── System monitor auto-refresh（v1.2.1 主線 B）───────────
+    # Timer 週期性 tick 呼叫既有的 get_system_stats_html，不新增運算；
+    # 勾選框關閉時回傳 active=False 的 Timer 更新，暫停輪詢，
+    # 手動按鈕在暫停狀態下仍可正常使用。
+    monitor_timer.tick(fn=get_system_stats_html, outputs=[monitor_html])
+    monitor_auto_refresh.change(
+        fn=lambda enabled: gr.Timer(value=3, active=bool(enabled)),
+        inputs=[monitor_auto_refresh],
+        outputs=[monitor_timer],
     )
 
     # ── Language radio ──────────────────────────────────────────
