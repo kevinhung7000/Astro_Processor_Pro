@@ -22,6 +22,10 @@
     # 系統監控支援（選用）：
     pip install psutil gputil --break-system-packages
 
+    # 降噪「quality」模式全精度支援（選用；沒裝則自動退回 v1.3.0 之前的
+    # 8-bit-in/float-out 行為，功能仍可運作，只是這個模式內部精度受限）：
+    pip install scikit-image --break-system-packages
+
     # GPU 運算硬體加速後端（選用，二選一，偵測成功後可自動加速背景漸層估算）：
     # 1. NVIDIA 顯示卡：
     pip install torch --break-system-packages
@@ -76,6 +80,18 @@ try:
     HAS_RAWPY = True
 except ImportError:
     HAS_RAWPY = False
+
+# v1.3.0 追加：denoise() 的 "quality" 模式改用 skimage 的 Non-local Means，
+# 原生支援 float32，藉此補上 cv2.fastNlMeansDenoisingColored 只吃 8-bit 的限制
+# （詳見 denoise() docstring）。純選用依賴——沒裝的話自動退回舊的
+# 「內部量化成 8-bit 再跑 OpenCV」行為，"quality" 模式功能不受影響，
+# 只是那一步的精度瓶頸會回來。
+try:
+    from skimage.restoration import denoise_nl_means
+    from skimage.color import rgb2lab, lab2rgb
+    HAS_SKIMAGE = True
+except ImportError:
+    HAS_SKIMAGE = False
 
 cv2.setNumThreads(os.cpu_count())
 
@@ -629,19 +645,35 @@ def boost_saturation(img01, sat_boost, bright_boost, r_gain, g_gain, b_gain):
     hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat_boost, 0, 1)
     hsv[:, :, 2] = np.clip(hsv[:, :, 2] * bright_boost, 0, 1)
     rgb01 = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
-    return (np.clip(rgb01, 0, 1) * 255).astype(np.uint8)
+    # v1.3.0：不再在這裡量化成 uint8——這是舊版整條 pipeline 最終輸出精度損失
+    # 的最後一步（finish_pipeline() 靠這個函式的回傳值決定最終圖片精度）。
+    # 現在維持 float32 [0,1]，由呼叫端決定何時／是否需要轉成 uint8（例如畫面
+    # 預覽用，或 JPEG 匯出用），真正需要全精度的 16-bit TIFF 匯出則完全不轉。
+    return np.clip(rgb01, 0, 1).astype(np.float32)
 
 
 
-def apply_clarity_and_sharpen(img8, clarity_blur, clarity_strength, sharpen_blur, sharpen_amount):
-    img_f = img8.astype(np.float32)
+def apply_clarity_and_sharpen(img01, clarity_blur, clarity_strength, sharpen_blur, sharpen_amount):
+    """v1.3.0：改為全程 float32 [0,1] 運算（之前是 uint8 [0,255]）。
+
+    clarity_strength / sharpen_amount 都是「原圖與模糊版本之間的差值」乘上的
+    比例係數，是相對運算，不受數值範圍是 0–255 或 0–1 影響，所以參數本身不用
+    另外換算，跟舊版的觀感是一致的。GaussianBlur 跟 addWeighted 都原生支援
+    float32（實測確認過，不像 fastNlMeansDenoisingColored 那樣有 8-bit 限制），
+    所以這裡不需要為了 OpenCV 相容性而分段量化。
+
+    舊版在 clarity 算完後、銳化前，會先把中間結果量化成 uint8 一次（`clarity =
+    np.clip(clarity, 0, 255).astype(np.uint8)`），這是本函式原本唯一的精度損失
+    來源，現在移除了。
+    """
+    img_f = img01.astype(np.float32)
     blur = cv2.GaussianBlur(img_f, (0, 0), sigmaX=clarity_blur)
     clarity = img_f + (img_f - blur) * clarity_strength
-    clarity = np.clip(clarity, 0, 255).astype(np.uint8)
+    clarity = np.clip(clarity, 0, 1).astype(np.float32)
 
     blur2 = cv2.GaussianBlur(clarity, (0, 0), sigmaX=sharpen_blur)
     sharpened = cv2.addWeighted(clarity, sharpen_amount, blur2, 1 - sharpen_amount, 0)
-    return np.clip(sharpened, 0, 255).astype(np.uint8)
+    return np.clip(sharpened, 0, 1).astype(np.float32)
 
 
 # ============================================================
@@ -780,6 +812,126 @@ def run_external_image_tool(img01, exe_path, extra_args, timeout=_EXTERNAL_TOOL_
             pass
 
 
+# ── v1.3.2：Cosmic Clarity Sharpen 專用介接（承接 v1.2.2 計畫的後續項目）──
+# 官方 SetiAstroCosmicClarity.py（Sharpen）跟已支援的 SetiAstroCosmicClarity_denoise.py
+# 一樣，用的是同一套「固定 <執行檔所在目錄>/input、<執行檔所在目錄>/output 資料夾」
+# 協定，差別只在輸出檔名字尾是 "_sharpened" 而不是 "_denoised"。以下直接照
+# run_cosmic_clarity_denoise() 的結構做一份近似複製。
+#
+# ⚠️ 查證狀態跟 run_cosmic_clarity_denoise() 不同，這裡誠實揭露：Denoise 版本
+# 當初有直接讀過官方原始碼，確認 headless CLI 路徑存在且 --denoise_strength
+# 是觸發條件（見上方 run_cosmic_clarity_denoise() 開頭的說明區塊）。Sharpen
+# 版本（SetiAstroCosmicClarity.py）目前只查證了官方文件裡提到的參數語意
+# （Stellar / Non-Stellar / Both 三種類型＋強度＋是否為線性影像），但沒有
+# 逐行讀過它的原始碼來確認實際 headless CLI 旗標拼法（例如強度參數究竟叫
+# --stellar_amount 還是別的名字）。因此下面刻意不像 denoise 版本那樣鎖定
+# 檢查某個特定旗標名稱是否存在，而是退而求其次要求 extra_args 不可為空——
+# 這樣至少能避免使用者完全沒帶任何參數、腳本大機率跳出 Tkinter GUI 導致
+# subprocess 卡住的情況，但不保證使用者帶的旗標名稱本身就是正確的。實際
+# 使用前建議先用 `<exe> --help` 或直接讀 SetiAstroCosmicClarity.py 原始碼
+# 核對一次。
+def run_cosmic_clarity_sharpen(img01, exe_path, extra_args="", timeout=_EXTERNAL_TOOL_TIMEOUT_SEC):
+    """呼叫 Seti Astro Cosmic Clarity（Sharpen）處理一張影像。
+
+    img01: float32 [0,1] RGB numpy 陣列 (H, W, 3)。
+    exe_path: SetiAstroCosmicClarity（Sharpen）執行檔路徑（使用者自行安裝/授權）。
+    extra_args: 直接附加在命令列的旗標字串，需自行對照實際版本的 CLI 說明
+        （或 --help 輸出）帶入正確旗標，例如強度、Stellar/Non-Stellar/Both
+        類型、是否為線性影像等——目前尚未逐一對照原始碼驗證確切旗標拼法
+        （見上方函式開頭的查證狀態說明）。不可留空，否則視為未設定 headless
+        參數，直接跳過本次呼叫，避免卡住等待 GUI。
+
+    回傳 (out_img01, error_message)，慣例同 run_cosmic_clarity_denoise()：
+    失敗時回傳原圖給呼叫端自行決定要不要跳過本步驟。
+    """
+    if not exe_path or not str(exe_path).strip():
+        return None, "尚未設定 Cosmic Clarity Sharpen 執行檔路徑"
+    exe_path = str(exe_path).strip()
+    if not os.path.isfile(exe_path):
+        return None, f"找不到 Cosmic Clarity Sharpen 執行檔：{exe_path}"
+    if not (extra_args or "").strip():
+        return None, "額外參數不可留空，否則可能跳出 GUI 視窗導致卡住（未執行）；請帶入 headless 模式所需的旗標"
+
+    exe_dir = os.path.dirname(os.path.abspath(exe_path))
+    in_dir = os.path.join(exe_dir, "input")
+    out_dir = os.path.join(exe_dir, "output")
+    try:
+        os.makedirs(in_dir, exist_ok=True)
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        return None, f"無法建立 Cosmic Clarity Sharpen 的 input/output 資料夾：{e}"
+
+    stem = f"astro_ext_{uuid.uuid4().hex}"
+    in_path = os.path.join(in_dir, stem + ".tif")
+    out_glob = os.path.join(out_dir, stem + "_sharpened.*")
+
+    try:
+        img16 = (np.clip(img01, 0, 1) * 65535.0).astype(np.uint16)
+        tifffile.imwrite(in_path, img16)
+
+        try:
+            arg_tokens = shlex.split(extra_args) if extra_args else []
+        except ValueError as e:
+            return None, f"額外命令列參數格式錯誤：{e}"
+
+        cmd = [exe_path] + arg_tokens
+        try:
+            result = subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
+        except subprocess.TimeoutExpired:
+            return None, f"Cosmic Clarity Sharpen 執行逾時（超過 {timeout} 秒）"
+        except FileNotFoundError:
+            return None, f"無法執行 Cosmic Clarity Sharpen：{exe_path}"
+        except OSError as e:
+            return None, f"呼叫 Cosmic Clarity Sharpen 失敗：{e}"
+
+        if result.returncode != 0:
+            stderr_tail = (result.stderr or "").strip()[-300:]
+            extra = f"：{stderr_tail}" if stderr_tail else ""
+            return None, f"Cosmic Clarity Sharpen 回傳非 0 錯誤代碼 ({result.returncode}){extra}"
+
+        candidates = [f for f in glob.glob(out_glob) if os.path.isfile(f)]
+        if not candidates:
+            return None, "Cosmic Clarity Sharpen 執行完畢，但在 output/ 資料夾找不到對應輸出檔（檔名規則：<原檔名>_sharpened.<副檔名>）"
+        candidates.sort(key=os.path.getmtime, reverse=True)
+        out_path = candidates[0]
+
+        try:
+            out16 = tifffile.imread(out_path)
+        except Exception:
+            try:
+                out16_bgr = cv2.imread(out_path, cv2.IMREAD_UNCHANGED)
+                if out16_bgr is None:
+                    raise ValueError("cv2.imread 回傳 None")
+                out16 = out16_bgr[:, :, ::-1] if out16_bgr.ndim == 3 else out16_bgr
+            except Exception as e2:
+                return None, f"讀取 Cosmic Clarity Sharpen 輸出檔失敗：{e2}"
+
+        if out16.ndim == 2:
+            out16 = np.stack([out16] * 3, axis=-1)
+        if out16.shape[-1] == 4:
+            out16 = out16[:, :, :3]
+
+        if out16.dtype == np.uint16:
+            out01 = out16.astype(np.float32) / 65535.0
+        elif out16.dtype == np.uint8:
+            out01 = out16.astype(np.float32) / 255.0
+        else:
+            out01 = np.clip(out16.astype(np.float32), 0.0, 1.0)
+
+        if out01.shape[:2] != img01.shape[:2]:
+            out01 = cv2.resize(out01, (img01.shape[1], img01.shape[0]), interpolation=cv2.INTER_CUBIC)
+
+        return np.clip(out01, 0.0, 1.0).astype(np.float32), None
+    finally:
+        cleanup_targets = [in_path] + glob.glob(out_glob)
+        for f in cleanup_targets:
+            try:
+                if os.path.isfile(f):
+                    os.remove(f)
+            except OSError:
+                pass
+
+
 # ── v1.2.2：Seti Astro Cosmic Clarity 專用介接 ─────────────────
 # 依 OPTIMIZATION_PLAN_v1.2.2.md 低優先項目要求，實機查證 setiastro/cosmicclarity
 # 官方原始碼（SetiAstroCosmicClarity_denoise.py, github.com/setiastro/cosmicclarity）
@@ -801,10 +953,15 @@ def run_external_image_tool(img01, exe_path, extra_args, timeout=_EXTERNAL_TOOL_
 #   3. 因此原計畫「先看原始碼再決定要不要投入支援」的建議事項已有明確答案：
 #      可行，不是「不適合套進通用外部工具介接功能」——只是需要獨立的資料流
 #      （寫進 exe 旁的 input/ 資料夾、從 output/ 資料夾照命名規則讀回），而非
-#      「不適合」。此區塊只涵蓋 Denoise（官方文件明確提到的那支）；Sharpen
+#      「不適合」。此區塊當初只涵蓋 Denoise（官方文件明確提到的那支）；Sharpen
 #      (SetiAstroCosmicClarity.py) 走的是同一套 exe_dir/input、exe_dir/output
-#      固定資料夾 + argparse 慣例，但輸出檔名是 "_sharpened" 字尾，若要支援
-#      需要另外一個很類似的函式，這裡先不展開。
+#      固定資料夾 + argparse 慣例，但輸出檔名是 "_sharpened" 字尾。
+#      v1.3.2 更新：Sharpen 版本的近似複製函式 run_cosmic_clarity_sharpen()
+#      已經補上（見下方，緊接在 run_cosmic_clarity_denoise() 之後）——查證
+#      程度比 Denoise 版本淺，實際 headless CLI 旗標名稱尚未逐行核對原始碼，
+#      詳見該函式開頭的說明。目前尚未接進 UI／pipeline（apply_clarity_and_sharpen()
+#      還沒有對應的 ext_path/ext_args 參數與下拉選單），需要的話可以後續再串接，
+#      串法可比照 denoise() 呼叫 run_cosmic_clarity_denoise() 的方式。
 def run_cosmic_clarity_denoise(img01, exe_path, extra_args="", timeout=_EXTERNAL_TOOL_TIMEOUT_SEC):
     """呼叫 Seti Astro Cosmic Clarity（Denoise）處理一張影像。
 
@@ -952,37 +1109,91 @@ EXTERNAL_TOOL_PROFILES_STAR = {
 }
 
 
-def denoise(img8, enable, mode, d, sigma_color, sigma_space, nlm_h, nlm_h_color,
+def denoise(img01, enable, mode, d, sigma_color, sigma_space, nlm_h, nlm_h_color,
             ext_path="", ext_args=""):
-    """降噪。
+    """降噪。輸入/輸出皆為 float32 [0,1]（v1.3.0 起，之前是 uint8 [0,255]，
+    詳見 finish_pipeline() 開頭的 v1.3.0 說明）。
 
     mode = "fast"（預設）：雙邊濾波(bilateralFilter)，速度快，適合即時預覽與一般使用。
-    mode = "quality"：cv2.fastNlMeansDenoisingColored，屬於 Non-local Means 演算法，
-        會在整張圖搜尋相似的小區塊來平均，降噪效果通常比雙邊濾波乾淨、更能保留細節邊緣，
-        但運算量遠高於雙邊濾波（一般會慢上數倍到十倍以上），較適合最終高解析度匯出而非即時預覽。
+        cv2.bilateralFilter 原生支援 8u 與 32f 兩種格式（不支援 16u），直接在
+        float32 上執行，不需要中途量化成 8-bit。sigmaColor 原本是針對 0–255
+        範圍調校的參數，這裡除以 255 換算成 0–1 範圍下等效的門檻，維持跟舊版
+        相同的相對降噪強度／參數觀感。
+    mode = "quality"：Non-local Means 演算法，會在整張圖搜尋相似的小區塊來平均，
+        降噪效果通常比雙邊濾波乾淨、更能保留細節邊緣，但運算量遠高於雙邊濾波
+        （一般會慢上數倍到十倍以上，v1.3.1 換成 skimage 實作後更是三個通道分開跑，
+        比原本 OpenCV 版本又更慢一截——細節見下方），較適合最終高解析度匯出而非即時預覽。
+
+        v1.3.1 更新：改用 skimage.restoration.denoise_nl_means，原生支援 float32，
+        補上 v1.3.0 遺留的已知限制（原本用的 cv2.fastNlMeansDenoisingColored 只吃
+        CV_8UC3/4，沒有 16-bit/float 版本，內部一定要先量化成 8-bit 才能跑）。
+        做法：先轉到 CIELAB 色彩空間（跟 OpenCV 原本內部做的事一樣——L 通道跟
+        a/b 色度通道分開跑，各自套用 nlm_h／nlm_h_color 對應的強度），三個通道都
+        在 float32 全精度下個別呼叫 denoise_nl_means，再轉回 RGB。全程沒有任何
+        8-bit 量化步驟。
+          - patch_size=7、patch_distance=10，對應原本 OpenCV 呼叫用的
+            templateWindowSize=7、searchWindowSize=21（21 = 2×10+1）。
+          - nlm_h／nlm_h_color 滑桿數值是舊版針對 0-255 尺度校準的，這裡做了
+            最佳近似換算（L 用 ×100/255 換算到 skimage Lab 的 0-100 尺度；
+            a/b 因為換算後量級跟原本 OpenCV 內部 0-255 尺度的 a/b 差不多，
+            數值直接沿用不額外縮放）——這是「盡力而為的近似換算」，不是
+            逐像素驗證過的精確等價，實際降噪感覺可能跟舊版有些微落差，
+            建議切換後依實際效果微調滑桿。
+          - ⚠️ 若未安裝 skimage（`HAS_SKIMAGE=False`），自動退回 v1.3.0 之前
+            的行為：內部量化成 8-bit 呼叫 cv2.fastNlMeansDenoisingColored，
+            跑完再轉回 float32。這不會讓程式壞掉或跳錯誤，只是那一步的
+            精度瓶頸會回來，且僅限使用者主動選擇 "quality" 模式時才有影響
+            （預設模式是 "fast"，不受此限制影響）。
     mode = "external"：方案 A 外部工具介接——呼叫使用者指定的外部降噪 CLI
         （例如 NoiseXTerminator / DeepSNR CLI）處理，失敗時直接跳過本步驟並
         回傳原圖（未降噪），不中斷 pipeline，也不會靜默改用 fast/quality 頂替。
+        外部工具本來就走 16-bit TIFF 暫存檔（見 run_external_image_tool()），
+        全程精度完整，不受這裡的修改影響。
     """
     if not enable:
-        return img8
+        return img01
     if mode == "external":
-        img01 = img8.astype(np.float32) / 255.0
         if "--denoise_strength" in (ext_args or ""):
             out01, err = run_cosmic_clarity_denoise(img01, ext_path, ext_args)
         else:
             out01, err = run_external_image_tool(img01, ext_path, ext_args)
         if err is not None:
             print(f"[外部降噪 external denoise] 已跳過，改用原圖（未降噪）: {err}")
-            return img8
-        return (np.clip(out01, 0, 1) * 255).astype(np.uint8)
+            return img01
+        return np.clip(out01, 0, 1).astype(np.float32)
     if mode == "quality":
-        return cv2.fastNlMeansDenoisingColored(
-            img8, None,
-            h=float(nlm_h), hColor=float(nlm_h_color),
-            templateWindowSize=7, searchWindowSize=21,
-        )
-    return cv2.bilateralFilter(img8, d=int(round(d)), sigmaColor=sigma_color, sigmaSpace=sigma_space)
+        if HAS_SKIMAGE:
+            # v1.3.1：全程 float32，不再有內部 8-bit 量化（詳見上方 docstring）。
+            img01c = np.clip(img01, 0, 1).astype(np.float32)
+            lab = rgb2lab(img01c)  # L: 0-100, a/b: 約 -128..127
+            h_l = float(nlm_h) * (100.0 / 255.0)
+            h_ab = float(nlm_h_color)
+            patch_size, patch_distance = 7, 10
+            nlm_kwargs = dict(patch_size=patch_size, patch_distance=patch_distance,
+                               fast_mode=True, preserve_range=True)
+            L_out = denoise_nl_means(lab[..., 0], h=h_l, **nlm_kwargs)
+            a_out = denoise_nl_means(lab[..., 1], h=h_ab, **nlm_kwargs)
+            b_out = denoise_nl_means(lab[..., 2], h=h_ab, **nlm_kwargs)
+            lab_out = np.stack([L_out, a_out, b_out], axis=-1).astype(np.float32)
+            out01 = lab2rgb(lab_out).astype(np.float32)
+            return np.clip(out01, 0, 1).astype(np.float32)
+        else:
+            # skimage 未安裝：退回 v1.3.0 之前的行為（內部量化成 8-bit）。
+            print("[降噪 quality 模式] 未安裝 scikit-image，退回 8-bit 內部量化的舊行為 "
+                  "（pip install scikit-image 可解除此限制）。")
+            img8 = (np.clip(img01, 0, 1) * 255.0).astype(np.uint8)
+            out8 = cv2.fastNlMeansDenoisingColored(
+                img8, None,
+                h=float(nlm_h), hColor=float(nlm_h_color),
+                templateWindowSize=7, searchWindowSize=21,
+            )
+            return out8.astype(np.float32) / 255.0
+    sigma_color_01 = float(sigma_color) / 255.0
+    out01 = cv2.bilateralFilter(
+        img01.astype(np.float32), d=int(round(d)),
+        sigmaColor=sigma_color_01, sigmaSpace=sigma_space,
+    )
+    return np.clip(out01, 0, 1).astype(np.float32)
 
 
 def detect_star_mask(img01, kernel_size, thresh, max_area, max_area_large, aspect_thresh, dilate_base, dilate_scale):
@@ -1292,13 +1503,26 @@ def finish_pipeline(img01, p):
     3. 飽和度 / 明度 / 通道增益（Saturation / Boost / Gain）
        最後才在已降噪且銳化完的影像上調整色彩，
        防止先飽和再做高斯 Clarity 在亮星周圍產生彩虹色邊（色相過飽和 + 模糊擴散）。
+
+    v1.3.0 位元深度修正：這三步以前每一步之間都會先量化成 uint8 [0,255]
+    再交給下一步（denoise 前、clarity/sharpen 中間、以及函式最終回傳都各自
+    quantize 一次），疊加三次獨立的捨入誤差。實際受影響最明顯的是背景漸層
+    扣除、動態範圍拉伸這類已經對原始暗部/弱訊號做過大幅拉伸的天文影像，
+    拉伸後的色階斷層（banding）在這種資料上比一般攝影更容易被看到。
+
+    現在整個函式全程維持 float32 [0,1]，只有 denoise() 內部的 "quality"
+    模式（NLM 降噪）仍會有一次無法避免的 8-bit 量化，因為那是 OpenCV
+    fastNlMeansDenoisingColored 本身的限制，不是這裡的問題（細節見
+    denoise() 的 docstring）。函式回傳的是 float32 [0,1]，不再是 uint8——
+    呼叫端（畫面預覽 / 全解析度匯出）依各自需求，在需要顯示或寫出 8-bit
+    格式（如 JPEG、螢幕預覽）時才轉成 uint8；寫 16-bit TIFF 時則直接用
+    這裡的 float32 結果換算，不會先損失精度再撐大格式。
     """
     # Step 1: 先降噪——保護微弱星雲邊界
-    img_work = img01  # float32 [0, 1]
+    img_work = np.clip(img01, 0, 1).astype(np.float32)  # float32 [0, 1]
     if p['denoise_enable']:
-        img8_tmp = (np.clip(img_work, 0, 1) * 255).astype(np.uint8)
-        img8_tmp = denoise(
-            img8_tmp, enable=True,
+        img_work = denoise(
+            img_work, enable=True,
             mode=p.get('denoise_mode', 'fast'),
             d=p['denoise_d'],
             sigma_color=p['denoise_sigma_color'],
@@ -1308,24 +1532,21 @@ def finish_pipeline(img01, p):
             ext_path=p.get('denoise_ext_path', ''),
             ext_args=p.get('denoise_ext_args', ''),
         )
-        img_work = img8_tmp.astype(np.float32) / 255.0
 
     # Step 2: Clarity + 銳化——在乾淨影像上提升局部對比
-    img8_cs = (np.clip(img_work, 0, 1) * 255).astype(np.uint8)
-    img8_cs = apply_clarity_and_sharpen(
-        img8_cs,
+    img_work = apply_clarity_and_sharpen(
+        img_work,
         p['clarity_blur'], p['clarity_strength'],
         p['sharpen_blur'], p['sharpen_amount']
     )
-    img_work = img8_cs.astype(np.float32) / 255.0
 
     # Step 3: 飽和度 / 明度 / 通道增益——最後調色，避免色偏擴散
-    img8 = boost_saturation(
+    img01_out = boost_saturation(
         img_work,
         p['sat_boost'], p['bright_boost'],
         p['r_gain'], p['g_gain'], p['b_gain']
     )
-    return img8
+    return img01_out  # float32 [0, 1]
 
 
 def build_target_mask_overlay(img_uint8, mask, contour_thresh=0.35):
@@ -1419,6 +1640,10 @@ def run_pipeline(img01, p, want_layers=False, preview_scale=1.0):
 
     # 1. 產生主畫面需要的成品（可能是縮星、無星或無處理）
     main_processed_img = process_stars(p['star_mode'], pre_star_img, star_mask, cluster_mask, p_star)
+    # v1.3.0：main_out 現在是 float32 [0,1]（之前是 uint8），保留完整精度，
+    # 供全解析度匯出時寫出真正的 16-bit TIFF。畫面顯示用的 uint8 版本只在
+    # 真正需要顯示的地方（例如下面的 target_mask_overlay）才轉換，呼叫端
+    # （預覽/匯出/批次函式）各自決定何時轉 uint8。
     main_out = finish_pipeline(main_processed_img, p)
 
     # 2. 如果使用者需要額外圖層，我們獨立且強制跑一次完整的「去星(Remove)」流程
@@ -1432,22 +1657,63 @@ def run_pipeline(img01, p, want_layers=False, preview_scale=1.0):
         )
         # 去星後，同樣走完最後的色彩與降噪流程，確保曝光色調跟主圖完全一致
         starless_out = finish_pipeline(pure_starless_img, p)
-    
+
+    # build_target_mask_overlay() 是純畫面顯示用途（半透明疊色 + 邊界線），
+    # 只需要 uint8，這裡才轉換，不影響 result['main'] 保留的 float32 精度。
+    main_out_uint8_for_overlay = (np.clip(main_out, 0, 1) * 255).astype(np.uint8)
+
     result = {
         'main': main_out,
         'mask': star_mask,
         'starless': starless_out,
-        'target_mask_overlay': build_target_mask_overlay(main_out, target_mask),
+        'target_mask_overlay': build_target_mask_overlay(main_out_uint8_for_overlay, target_mask),
     }
     return result
 
 
-def save_image_files(img8, out_dir, name):
-    out_jpg = os.path.join(out_dir, f"{name}.jpg")
-    out_tif = os.path.join(out_dir, f"{name}.tif")
-    cv2.imwrite(out_jpg, cv2.cvtColor(img8, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 96])
-    img16 = (img8.astype(np.uint16) * 257)
-    cv2.imwrite(out_tif, cv2.cvtColor(img16, cv2.COLOR_RGB2BGR))
+def save_image_files(img01, out_dir, name, formats=("jpg", "tif")):
+    """輸出 JPEG（8-bit，供快速預覽/分享）與/或 TIFF（真 16-bit，供後續編修）。
+
+    img01: float32 [0,1]，來自 finish_pipeline() 的全精度結果。
+    formats: 要寫出的格式集合，可包含 "jpg"、"tif"（大小寫不拘）。預設沿用
+        舊行為，兩種都寫。v1.3.2 新增：批次/單張匯出時如果只需要其中一種格式，
+        可以省下另一種格式的匯出時間與硬碟用量（`export_fn()`／
+        `batch_process_fn()` 呼叫端可透過 UI 勾選框控制）。
+
+    回傳 (out_jpg, out_tif)：對應格式沒有被選取時該欄位為 None，呼叫端需自行
+    判斷是否為 None 再使用（例如組訊息、組下載連結時跳過）。
+
+    v1.3.0 修正：以前這裡收到的是已經被 finish_pipeline() 沿路量化過的
+    uint8 結果，「16-bit TIFF」只是把 8-bit 數值撐大（`img8.astype(np.uint16)
+    * 257`），容器是 16-bit，內容其實還是 8-bit。現在改成直接吃全精度的
+    float32，用 round() 換算成真正的 16-bit 數值，TIFF 檔案裡的色階數量
+    才會名副其實。改用 tifffile 寫 TIFF（而不是 cv2.imwrite）也跟本檔案
+    其他地方寫 16-bit TIFF 的方式一致（見 run_external_image_tool()／
+    run_cosmic_clarity_denoise()）——tifffile 直接吃 RGB 順序，不像 cv2
+    需要先轉 BGR。
+    """
+    formats_norm = {str(f).strip().lower() for f in (formats or ())}
+    if not formats_norm:
+        # 保底：一種格式都沒選到的話，維持舊版「兩種都寫」的行為，
+        # 避免因為呼叫端傳空集合而完全沒有輸出檔案。
+        formats_norm = {"jpg", "tif"}
+    want_jpg = bool(formats_norm & {"jpg", "jpeg"})
+    want_tif = bool(formats_norm & {"tif", "tiff"})
+
+    img01_clipped = np.clip(img01, 0, 1).astype(np.float32)
+
+    out_jpg = None
+    if want_jpg:
+        out_jpg = os.path.join(out_dir, f"{name}.jpg")
+        img8 = (img01_clipped * 255.0 + 0.5).astype(np.uint8)
+        cv2.imwrite(out_jpg, cv2.cvtColor(img8, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 96])
+
+    out_tif = None
+    if want_tif:
+        out_tif = os.path.join(out_dir, f"{name}.tif")
+        img16 = (img01_clipped * 65535.0 + 0.5).astype(np.uint16)
+        tifffile.imwrite(out_tif, img16)
+
     return out_jpg, out_tif
 
 
@@ -1896,13 +2162,16 @@ def update_preview_fn(preview_base, preview_scale, full_img, use_full_res, live_
         t0 = time.perf_counter()
         result = run_pipeline(img_to_use, p, want_layers=False, preview_scale=scale_to_use)
         elapsed = time.perf_counter() - t0
-        main_out = result['main']
-        hist_out = generate_histogram(main_out)
+        # v1.3.0：result['main'] 現在是 float32 [0,1]（供匯出用的全精度結果），
+        # 這裡是純畫面顯示路徑，轉成 uint8 給 Gradio Image / 直方圖 / 比較滑桿用，
+        # 不影響匯出時實際用到的精度。
+        main_out_uint8 = (np.clip(result['main'], 0, 1) * 255).astype(np.uint8)
+        hist_out = generate_histogram(main_out_uint8)
         original_uint8 = (np.clip(img_to_use, 0, 1) * 255).astype(np.uint8)
         tag = ("全解析度原圖運算" if lang == "zh" else "Full-res image processing") if use_full else ("縮圖運算" if lang == "zh" else "Thumbnail processing")
-        slider_html = build_compare_slider_html(original_uint8, main_out, lang)
+        slider_html = build_compare_slider_html(original_uint8, main_out_uint8, lang)
         status_msg = f"✅ 預覽與 RGB 曲線已更新({tag}，{elapsed:.2f}s)" if lang == "zh" else f"✅ Preview and RGB histogram updated ({tag}, {elapsed:.2f}s)"
-        return main_out, original_uint8, hist_out, status_msg, slider_html
+        return main_out_uint8, original_uint8, hist_out, status_msg, slider_html
     except Exception as e:
         err_msg = f"❌ 預覽發生錯誤: {e}" if lang == "zh" else f"❌ Preview error: {e}"
         return None, None, None, err_msg, build_compare_slider_html(None, None, lang)
@@ -1927,7 +2196,10 @@ def layer_preview_fn(preview_base, preview_scale, full_img, use_full_res, lang, 
         result = run_pipeline(img_to_use, p, want_layers=True, preview_scale=scale_to_use)
         elapsed = time.perf_counter() - t0
         mask = result.get('mask')
-        starless = result.get('starless')
+        # v1.3.0：result['starless'] 現在是 float32 [0,1]，這裡是畫面顯示用途，
+        # 轉成 uint8 給 gr.Image；跟 update_preview_fn 一樣不影響匯出精度。
+        starless_raw = result.get('starless')
+        starless = None if starless_raw is None else (np.clip(starless_raw, 0, 1) * 255).astype(np.uint8)
         target_overlay = result.get('target_mask_overlay')
         tag = ("全解析度原圖" if lang == "zh" else "Full resolution image") if use_full else ("縮圖版本，星點參數已依縮圖比例等比例換算" if lang == "zh" else "Thumbnail version, star parameters scaled accordingly")
         if mask is None:
@@ -1981,7 +2253,8 @@ def local_preview_fn(full_img, x_pct, y_pct, crop_px, lang, *param_values):
         t0 = time.perf_counter()
         result = run_pipeline(crop_f32, p, want_layers=False, preview_scale=1.0)
         elapsed = time.perf_counter() - t0
-        processed_uint8 = result['main']
+        # v1.3.0：result['main'] 現在是 float32 [0,1]，這裡是畫面顯示用途，轉成 uint8。
+        processed_uint8 = (np.clip(result['main'], 0, 1) * 255).astype(np.uint8)
 
         # 產生標示裁切框的縮略圖
         thumb_max = 700
@@ -2008,7 +2281,7 @@ def local_preview_fn(full_img, x_pct, y_pct, crop_px, lang, *param_values):
         return None, None, err
 
 
-def export_fn(full_img, out_dir, out_name, want_layers, lang, *param_values):
+def export_fn(full_img, out_dir, out_name, want_layers, lang, export_formats, *param_values):
 
     if full_img is None:
         msg = "⚠️ 請先載入圖片" if lang == "zh" else "⚠️ Please load an image first"
@@ -2022,14 +2295,14 @@ def export_fn(full_img, out_dir, out_name, want_layers, lang, *param_values):
         # 全解析度匯出：preview_scale=1.0，星點縮小/去星參數直接採用使用者設定的原始數值
         result = run_pipeline(full_img, p, want_layers=want_layers, preview_scale=1.0)
         files = []
-        jpg_path, tif_path = save_image_files(result['main'], out_dir, out_name)
-        files += [jpg_path, tif_path]
+        jpg_path, tif_path = save_image_files(result['main'], out_dir, out_name, formats=export_formats)
+        files += [f for f in (jpg_path, tif_path) if f]
         if want_layers and 'mask' in result:
             mask_path = os.path.join(out_dir, f"{out_name}_starmask.png")
             cv2.imwrite(mask_path, result['mask'])
             files.append(mask_path)
-            sl_jpg, sl_tif = save_image_files(result['starless'], out_dir, f"{out_name}_starless")
-            files += [sl_jpg, sl_tif]
+            sl_jpg, sl_tif = save_image_files(result['starless'], out_dir, f"{out_name}_starless", formats=export_formats)
+            files += [f for f in (sl_jpg, sl_tif) if f]
         elapsed = time.perf_counter() - t0
         msg = (f"✅ 匯出完成，共 {len(files)} 個檔案，總耗時 {elapsed:.2f}s → `{out_dir}`"
                if lang == "zh" else
@@ -2042,7 +2315,7 @@ def export_fn(full_img, out_dir, out_name, want_layers, lang, *param_values):
         return err_msg, None
 
 
-def batch_process_fn(folder, out_dir, want_layers, lang, *param_values):
+def batch_process_fn(folder, out_dir, want_layers, lang, stop_state, formats, *param_values):
     """批次處理：對資料夾內每一張圖套用目前的參數集，逐一以全解析度處理並匯出。
 
     設計成 generator（每處理完一張就 yield 一次最新狀態文字），這樣 Gradio 前端
@@ -2051,6 +2324,13 @@ def batch_process_fn(folder, out_dir, want_layers, lang, *param_values):
 
     單張圖失敗（例如檔案損毀、記憶體不足）不會中斷整批次，只會記錄錯誤並繼續下一張，
     最後在摘要裡列出成功/失敗數量與失敗檔名，方便使用者事後排查。
+
+    stop_state: v1.3.2 新增。一個可變的 dict（見 state_batch_stop 定義處的說明），
+        由「停止批次」按鈕原地修改 stop_state["stop"] = True。這裡在每張圖片
+        開始處理前檢查一次——檢查點刻意放在單張圖片的邊界，而不是圖片處理到
+        一半就強制中斷，這樣不會留下寫到一半的殘缺輸出檔，語意上也比較單純
+        （已經在跑的這張圖片一定會跑完）。
+    formats: 匯出格式清單（例如 ["JPG", "TIFF"]），轉呼叫 save_image_files()。
     """
     if not folder or not os.path.isdir(folder):
         msg = "⚠️ 請先輸入有效的來源資料夾路徑" if lang == "zh" else "⚠️ Please enter a valid source folder path"
@@ -2068,9 +2348,18 @@ def batch_process_fn(folder, out_dir, want_layers, lang, *param_values):
     os.makedirs(out_dir, exist_ok=True)
     p = collect_params(param_values)
 
+    # 每次新批次開跑時，把（可能殘留自上一批次的）停止旗標重設為 False。
+    # 這裡「原地修改」而不是重新 assign 一個新 dict，確保「停止」按鈕日後
+    # 修改的仍是同一份物件（詳見函式開頭與 state_batch_stop 定義處的說明）。
+    if isinstance(stop_state, dict):
+        stop_state["stop"] = False
+    else:
+        stop_state = {"stop": False}
+
     total = len(files)
     done, failed = 0, []
     log_lines = []
+    stopped_early = False
 
     header = (f"🚀 批次處理開始，共 {total} 張圖片 → 輸出至 `{out_dir}`"
                if lang == "zh" else
@@ -2079,15 +2368,19 @@ def batch_process_fn(folder, out_dir, want_layers, lang, *param_values):
 
     batch_t0 = time.perf_counter()
     for i, fname in enumerate(files, 1):
+        if isinstance(stop_state, dict) and stop_state.get("stop"):
+            stopped_early = True
+            break
+
         base_name = os.path.splitext(fname)[0]
         file_t0 = time.perf_counter()
         try:
             img = load_image_any(os.path.join(folder, fname))
             result = run_pipeline(img, p, want_layers=want_layers, preview_scale=1.0)
-            save_image_files(result['main'], out_dir, base_name)
+            save_image_files(result['main'], out_dir, base_name, formats=formats)
             if want_layers and 'mask' in result:
                 cv2.imwrite(os.path.join(out_dir, f"{base_name}_starmask.png"), result['mask'])
-                save_image_files(result['starless'], out_dir, f"{base_name}_starless")
+                save_image_files(result['starless'], out_dir, f"{base_name}_starless", formats=formats)
             file_elapsed = time.perf_counter() - file_t0
             done += 1
             log_lines.append(f"✅ [{i}/{total}] {fname}（{file_elapsed:.2f}s）" if lang == "zh"
@@ -2113,7 +2406,17 @@ def batch_process_fn(folder, out_dir, want_layers, lang, *param_values):
         yield status
 
     total_elapsed = time.perf_counter() - batch_t0
-    if failed:
+    if stopped_early:
+        remaining_count = total - done - len(failed)
+        summary = (f"⏹ 批次已依使用者要求停止：成功 {done} 張，失敗 {len(failed)} 張，"
+                   f"尚未處理 {remaining_count} 張，總耗時 {total_elapsed:.1f}s → `{out_dir}`"
+                   if lang == "zh" else
+                   f"⏹ Batch stopped by user: {done} succeeded, {len(failed)} failed, "
+                   f"{remaining_count} not processed, total {total_elapsed:.1f}s → `{out_dir}`")
+        if failed:
+            fail_list = "、".join(failed) if lang == "zh" else ", ".join(failed)
+            summary += (f"\n\n失敗檔案：{fail_list}" if lang == "zh" else f"\n\nFailed files: {fail_list}")
+    elif failed:
         fail_list = "、".join(failed) if lang == "zh" else ", ".join(failed)
         summary = (f"🏁 批次處理完成：成功 {done} 張，失敗 {len(failed)} 張，總耗時 {total_elapsed:.1f}s → `{out_dir}`\n\n失敗檔案：{fail_list}"
                     if lang == "zh" else
@@ -2325,8 +2628,8 @@ UI_TRANSLATIONS = {
     },
     "denoise_enable": {"zh": "啟用降噪", "en": "Enable Denoise"},
     "denoise_mode": {
-        "zh": ("降噪模式", "fast=雙邊濾波(快); quality=Non-local Means(較乾淨但慢很多，適合最終匯出); external=呼叫外部 ML 降噪工具(見下方設定)"),
-        "en": ("Denoise Mode", "fast = Bilateral Filter (quick); quality = Non-local Means (cleaner but much slower, best for final export); external = calls an external ML denoiser (see settings below)"),
+        "zh": ("降噪模式", "fast=雙邊濾波(快); quality=Non-local Means(較乾淨但慢很多，適合最終匯出，全精度需安裝 scikit-image，未安裝則退回 8-bit 內部處理); external=呼叫外部 ML 降噪工具(見下方設定)"),
+        "en": ("Denoise Mode", "fast = Bilateral Filter (quick); quality = Non-local Means (cleaner but much slower, best for final export; full precision requires scikit-image, otherwise falls back to 8-bit internal processing); external = calls an external ML denoiser (see settings below)"),
     },
     "denoise_ext_path": {
         "zh": ("[external]外部降噪工具執行檔路徑",
@@ -2496,6 +2799,10 @@ UI_TRANSLATIONS = {
     "output_dir": {"zh": "輸出資料夾", "en": "Output Directory"},
     "output_name": {"zh": "輸出檔名(不含副檔名)", "en": "Output Filename (without extension)"},
     "save_layers": {"zh": "額外輸出星點遮罩 + 去星背景層(可供後續人工疊圖疊加)", "en": "Export Star Mask and Starless Layers (for manual stacking)"},
+    "export_formats": {
+        "zh": ("匯出格式", "只需要其中一種格式時可取消勾選，省下匯出時間與硬碟空間"),
+        "en": ("Export Formats", "Uncheck a format you don't need to save export time and disk space"),
+    },
     "export_btn": {"zh": "🚀 開始高解析度跑圖與匯出", "en": "🚀 Start High-Res Processing & Export"},
     "export_files": {"zh": "下載生成的結果檔案", "en": "Download Generated Results"},
     "preview_hist": {"zh": "RGB 通道分佈曲線", "en": "RGB Channel Histogram"},
@@ -2556,6 +2863,11 @@ UI_TRANSLATIONS = {
     },
     "batch_out_dir": {"zh": "批次輸出資料夾", "en": "Batch Output Folder"},
     "batch_want_layers": {"zh": "每張圖同時輸出星點遮罩 + 去星背景層", "en": "Also export star mask + starless layer for each image"},
+    "batch_formats": {
+        "zh": ("匯出格式", "只需要其中一種格式時可取消勾選，批次量大時能省下不少時間與硬碟空間"),
+        "en": ("Export Formats", "Uncheck a format you don't need — saves significant time/disk on large batches"),
+    },
+    "batch_stop_btn": {"zh": "⏹ 停止批次", "en": "⏹ Stop Batch"},
     "batch_btn": {"zh": "🚀 開始批次處理整個資料夾", "en": "🚀 Start Batch Processing"},
     "close_btn": {"zh": "✕ 關閉", "en": "✕ Close"},
     "acc_presets": {"zh": "0️⃣a 🎛️ 新手預設集", "en": "0️⃣a 🎛️ Beginner Presets"},
@@ -2746,19 +3058,30 @@ def get_status_bar_html(proc_time=None, lang="zh"):
         except Exception:
             pass
 
+    # v1.3.2：補上 get_system_stats_html() 在 v1.2.1 就有的 DirectML fallback —
+    # 之前這裡 GPUtil 找不到 NVIDIA 顯卡時會直接落到 "N/A"，AMD/Intel 使用者
+    # 在狀態列完全看不出 GPU 有沒有在跑，跟監控面板的行為不一致。
+    gpu_shown = False
     if HAS_GPUTIL:
         try:
             gpus = _GPUtil.getGPUs()
-            if gpus:
-                g = gpus[0]
-                gpu_str = f"{g.load * 100:.0f}% | {g.memoryUsed / 1024:.1f} GB"
         except Exception:
-            pass
-    elif USE_GPU and HAS_TORCH:
+            gpus = []
+        if gpus:
+            g = gpus[0]
+            gpu_str = f"{g.load * 100:.0f}% | {g.memoryUsed / 1024:.1f} GB"
+            gpu_shown = True
+
+    if not gpu_shown and USE_GPU and _IS_DIRECTML:
+        gpu_str = "DirectML 加速中" if lang == "zh" else "DirectML active"
+        gpu_shown = True
+
+    if not gpu_shown and USE_GPU and HAS_TORCH:
         try:
             import torch
             if torch.cuda.is_available():
                 gpu_str = f"{torch.cuda.memory_allocated() / (1024**3):.1f} GB alloc"
+                gpu_shown = True
         except Exception:
             pass
 
@@ -3213,6 +3536,13 @@ with gr.Blocks(
     state_snap_a        = gr.State(None)
     state_snap_b        = gr.State(None)
     state_snap_c        = gr.State(None)
+    # v1.3.2：批次處理停止旗標。刻意用「內容可變的 dict」而不是單純的 bool，
+    # 是因為 batch_process_fn() 在批次開始當下就把這個物件當一般參數收下、
+    # 存成區域變數，之後不會再重新跟 Gradio session 要一次新的值；如果用不可變的
+    # bool，「停止」按鈕之後才寫回 session 的新值，正在跑的那個 generator 根本看
+    # 不到。改成傳同一個 dict 物件、用「原地修改」（stop_state["stop"] = True）
+    # 而不是整個替換掉，批次迴圈裡每次檢查的才會是同一份、被按鈕即時改過的資料。
+    state_batch_stop    = gr.State({"stop": False})
 
     # ── Top Toolbar (Gradio Row) ──────────────────────────────
     with gr.Row(elem_id="pro-toolbar-row", equal_height=True):
@@ -3555,6 +3885,12 @@ with gr.Blocks(
                         label="額外輸出星點遮罩 + 去星背景層(可供後續人工疊圖疊加)",
                         value=True
                     )
+                    export_formats = gr.CheckboxGroup(
+                        choices=["JPG", "TIFF"],
+                        value=["JPG", "TIFF"],
+                        label="匯出格式",
+                        info="只需要其中一種格式時可取消勾選，省下匯出時間與硬碟空間",
+                    )
                     export_btn    = gr.Button("🚀 開始高解析度跑圖與匯出", variant="primary")
                     export_status = gr.Markdown("")
                     export_files  = gr.File(
@@ -3572,7 +3908,15 @@ with gr.Blocks(
                     batch_want_layers = gr.Checkbox(
                         label="每張圖同時輸出星點遮罩 + 去星背景層", value=False
                     )
-                    batch_btn = gr.Button("🚀 開始批次處理整個資料夾", variant="primary")
+                    batch_formats = gr.CheckboxGroup(
+                        choices=["JPG", "TIFF"],
+                        value=["JPG", "TIFF"],
+                        label="匯出格式",
+                        info="只需要其中一種格式時可取消勾選，批次量大時能省下不少時間與硬碟空間",
+                    )
+                    with gr.Row():
+                        batch_btn = gr.Button("🚀 開始批次處理整個資料夾", variant="primary")
+                        batch_stop_btn = gr.Button("⏹ 停止批次", variant="stop")
                     batch_status = gr.Markdown("")
 
                 # ── Tab: Local ROI Preview ────────────────────
@@ -3771,6 +4115,7 @@ with gr.Blocks(
         (output_dir, "output_dir"),
         (output_name, "output_name"),
         (save_layers, "save_layers"),
+        (export_formats, "export_formats"),
         (export_btn, "export_btn"),
         (export_files, "export_files"),
         (preview_hist, "preview_hist"),
@@ -3810,6 +4155,8 @@ with gr.Blocks(
         (batch_hint_md, "batch_hint_md"),
         (batch_out_dir, "batch_out_dir"),
         (batch_want_layers, "batch_want_layers"),
+        (batch_formats, "batch_formats"),
+        (batch_stop_btn, "batch_stop_btn"),
         (batch_btn, "batch_btn"),
         (close_btn, "close_btn"),
         (presets_hint_md, "presets_hint_md"),
@@ -3852,7 +4199,7 @@ with gr.Blocks(
                     updates.append(gr.update(value=btn_label))
                 elif key in ["scan_btn", "load_btn", "cfg_export_btn", "reset_btn",
                              "layer_preview_btn", "export_btn", "monitor_refresh_btn",
-                             "local_preview_btn", "batch_btn", "close_btn",
+                             "local_preview_btn", "batch_btn", "batch_stop_btn", "close_btn",
                              "preset_milky_way_btn", "preset_nebula_btn", "preset_light_pollution_btn",
                              "snap_a_save_btn", "snap_a_load_btn", "snap_b_save_btn", "snap_b_load_btn",
                              "snap_c_save_btn", "snap_c_load_btn", "snap_save_file_btn"]:
@@ -4012,7 +4359,7 @@ with gr.Blocks(
     # ── Full-res export ───────────────────────────────────────
     export_btn.click(
         fn=export_fn,
-        inputs=[state_full, output_dir, output_name, save_layers, state_lang] + PARAM_COMPONENTS,
+        inputs=[state_full, output_dir, output_name, save_layers, state_lang, export_formats] + PARAM_COMPONENTS,
         outputs=[export_status, export_files],
     ).then(
         fn=get_status_bar_html,
@@ -4021,10 +4368,33 @@ with gr.Blocks(
     )
 
     # ── Batch processing (reuses folder_box from the load tab as source) ──
-    batch_btn.click(
+    batch_event = batch_btn.click(
         fn=batch_process_fn,
-        inputs=[folder_box, batch_out_dir, batch_want_layers, state_lang] + PARAM_COMPONENTS,
+        inputs=[folder_box, batch_out_dir, batch_want_layers, state_lang,
+                state_batch_stop, batch_formats] + PARAM_COMPONENTS,
         outputs=[batch_status],
+    )
+
+    # v1.3.2：批次停止按鈕。除了原地修改 state_batch_stop（讓正在跑的
+    # batch_process_fn() 在下一張圖片開始前的檢查點看到旗標並提早結束、
+    # 印出正常的「已停止」摘要訊息），另外也用 Gradio 內建的 cancels 機制
+    # 保底：萬一某次呼叫卡在檢查點之間很久沒有 yield（例如單張圖片處理
+    # 特別慢），至少 Gradio 佇列本身也會嘗試中止這個事件。
+    def request_batch_stop_fn(stop_state, lang):
+        if isinstance(stop_state, dict):
+            stop_state["stop"] = True
+        else:
+            stop_state = {"stop": True}
+        msg = ("⏹ 已送出停止要求，將在目前這張圖片處理完後停止批次…" if lang == "zh"
+               else "⏹ Stop requested — batch will halt after the current file finishes…")
+        return stop_state, msg
+
+    batch_stop_btn.click(
+        fn=request_batch_stop_fn,
+        inputs=[state_batch_stop, state_lang],
+        outputs=[state_batch_stop, batch_status],
+    ).then(
+        fn=None, inputs=None, outputs=None, cancels=[batch_event], queue=False,
     )
 
     # ── Local ROI preview ─────────────────────────────────────
