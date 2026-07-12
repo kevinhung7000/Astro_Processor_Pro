@@ -44,6 +44,7 @@ import subprocess
 import tempfile
 import shlex
 import glob
+import uuid
 
 # --- PyInstaller --noconsole 修正：無終端機時 sys.stdout/stderr 為 None ---
 # uvicorn 的 logging 設定會呼叫 stream.isatty()，None 沒有這個方法會直接崩潰，
@@ -779,33 +780,175 @@ def run_external_image_tool(img01, exe_path, extra_args, timeout=_EXTERNAL_TOOL_
             pass
 
 
+# ── v1.2.2：Seti Astro Cosmic Clarity 專用介接 ─────────────────
+# 依 OPTIMIZATION_PLAN_v1.2.2.md 低優先項目要求，實機查證 setiastro/cosmicclarity
+# 官方原始碼（SetiAstroCosmicClarity_denoise.py, github.com/setiastro/cosmicclarity）
+# 後確認：
+#   1. 官方文件描述的「Full or Luminance 互動選單」是 Tkinter GUI（不是卡在 stdin
+#      的 input() 提示），而且原始碼裡有明確的 headless 分支：
+#          if denoise_strength is None:      # 沒帶 --denoise_strength 才跳 GUI
+#              ... get_user_input() ...      # Tkinter 對話框
+#          else:                             # headless path
+#              ...
+#      → 只要在命令列帶 --denoise_strength，就完全不會跳出視窗，可以正常用
+#        subprocess 呼叫，不會像原本假設的那樣卡住。
+#   2. 但它的輸入/輸出協定跟 run_external_image_tool() 假設的「單一輸入檔＋單一
+#      輸出檔路徑」慣例不同：Cosmic Clarity 的 input_dir/output_dir 是寫死在程式
+#      裡的 <執行檔所在目錄>/input、<執行檔所在目錄>/output，不能用 --input/--output
+#      指定成別的路徑；輸出檔名規則固定是「<輸入檔主檔名>_denoised.<副檔名>」。
+#      所以不能直接套用通用 {input}/{output} 佔位符機制，需要專用的
+#      run_cosmic_clarity_denoise()。
+#   3. 因此原計畫「先看原始碼再決定要不要投入支援」的建議事項已有明確答案：
+#      可行，不是「不適合套進通用外部工具介接功能」——只是需要獨立的資料流
+#      （寫進 exe 旁的 input/ 資料夾、從 output/ 資料夾照命名規則讀回），而非
+#      「不適合」。此區塊只涵蓋 Denoise（官方文件明確提到的那支）；Sharpen
+#      (SetiAstroCosmicClarity.py) 走的是同一套 exe_dir/input、exe_dir/output
+#      固定資料夾 + argparse 慣例，但輸出檔名是 "_sharpened" 字尾，若要支援
+#      需要另外一個很類似的函式，這裡先不展開。
+def run_cosmic_clarity_denoise(img01, exe_path, extra_args="", timeout=_EXTERNAL_TOOL_TIMEOUT_SEC):
+    """呼叫 Seti Astro Cosmic Clarity（Denoise）處理一張影像。
+
+    img01: float32 [0,1] RGB numpy 陣列 (H, W, 3)。
+    exe_path: SetiAstroCosmicClarity_denoise 執行檔路徑（使用者自行安裝/授權）。
+    extra_args: 直接附加在命令列的旗標字串，例如：
+        "--denoise_strength 0.5 --denoise_mode luminance"
+        "--denoise_strength 0.5 --denoise_mode full --disable_gpu"
+        必須至少包含 --denoise_strength，否則官方腳本會判定成沒有走 headless
+        path，改跳出 Tkinter GUI 視窗等使用者操作，subprocess 呼叫端會卡住
+        直到逾時。
+
+    回傳 (out_img01, error_message)，慣例同 run_external_image_tool()：
+    失敗時回傳原圖給呼叫端自行決定要不要跳過本步驟。
+    """
+    if not exe_path or not str(exe_path).strip():
+        return None, "尚未設定 Cosmic Clarity 執行檔路徑"
+    exe_path = str(exe_path).strip()
+    if not os.path.isfile(exe_path):
+        return None, f"找不到 Cosmic Clarity 執行檔：{exe_path}"
+    if "--denoise_strength" not in extra_args:
+        return None, "額外參數必須包含 --denoise_strength，否則會跳出 GUI 視窗導致卡住（未執行）"
+
+    exe_dir = os.path.dirname(os.path.abspath(exe_path))
+    in_dir = os.path.join(exe_dir, "input")
+    out_dir = os.path.join(exe_dir, "output")
+    try:
+        os.makedirs(in_dir, exist_ok=True)
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        return None, f"無法建立 Cosmic Clarity 的 input/output 資料夾：{e}"
+
+    stem = f"astro_ext_{uuid.uuid4().hex}"
+    in_path = os.path.join(in_dir, stem + ".tif")
+    out_glob = os.path.join(out_dir, stem + "_denoised.*")
+
+    try:
+        img16 = (np.clip(img01, 0, 1) * 65535.0).astype(np.uint16)
+        tifffile.imwrite(in_path, img16)
+
+        try:
+            arg_tokens = shlex.split(extra_args) if extra_args else []
+        except ValueError as e:
+            return None, f"額外命令列參數格式錯誤：{e}"
+
+        cmd = [exe_path] + arg_tokens
+        try:
+            result = subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
+        except subprocess.TimeoutExpired:
+            return None, f"Cosmic Clarity 執行逾時（超過 {timeout} 秒）"
+        except FileNotFoundError:
+            return None, f"無法執行 Cosmic Clarity：{exe_path}"
+        except OSError as e:
+            return None, f"呼叫 Cosmic Clarity 失敗：{e}"
+
+        if result.returncode != 0:
+            stderr_tail = (result.stderr or "").strip()[-300:]
+            extra = f"：{stderr_tail}" if stderr_tail else ""
+            return None, f"Cosmic Clarity 回傳非 0 錯誤代碼 ({result.returncode}){extra}"
+
+        candidates = [f for f in glob.glob(out_glob) if os.path.isfile(f)]
+        if not candidates:
+            return None, "Cosmic Clarity 執行完畢，但在 output/ 資料夾找不到對應輸出檔（檔名規則：<原檔名>_denoised.<副檔名>）"
+        candidates.sort(key=os.path.getmtime, reverse=True)
+        out_path = candidates[0]
+
+        try:
+            out16 = tifffile.imread(out_path)
+        except Exception:
+            try:
+                out16_bgr = cv2.imread(out_path, cv2.IMREAD_UNCHANGED)
+                if out16_bgr is None:
+                    raise ValueError("cv2.imread 回傳 None")
+                out16 = out16_bgr[:, :, ::-1] if out16_bgr.ndim == 3 else out16_bgr
+            except Exception as e2:
+                return None, f"讀取 Cosmic Clarity 輸出檔失敗：{e2}"
+
+        if out16.ndim == 2:
+            out16 = np.stack([out16] * 3, axis=-1)
+        if out16.shape[-1] == 4:
+            out16 = out16[:, :, :3]
+
+        if out16.dtype == np.uint16:
+            out01 = out16.astype(np.float32) / 65535.0
+        elif out16.dtype == np.uint8:
+            out01 = out16.astype(np.float32) / 255.0
+        else:
+            out01 = np.clip(out16.astype(np.float32), 0.0, 1.0)
+
+        if out01.shape[:2] != img01.shape[:2]:
+            out01 = cv2.resize(out01, (img01.shape[1], img01.shape[0]), interpolation=cv2.INTER_CUBIC)
+
+        return np.clip(out01, 0.0, 1.0).astype(np.float32), None
+    finally:
+        cleanup_targets = [in_path] + glob.glob(out_glob)
+        for f in cleanup_targets:
+            try:
+                if os.path.isfile(f):
+                    os.remove(f)
+            except OSError:
+                pass
+
+
 # ── v1.2.1 主線 A：外部工具範本對照表 ─────────────────────────
 # 純 UI 便利性用途：選了範本，自動把對應「額外命令列參數」字串帶進欄位，
 # 不需要使用者自己記或手打各家工具的 CLI 語法。不影響 run_external_image_tool()
 # 本身的呼叫邏輯，也不會被寫進 PARAM_NAMES/DEFAULTS（純粹是填欄位用的捷徑，
 # 不是需要跟著參數快照/設定檔一起保存的處理參數）。
 #
-# 語法查證狀態（撰寫時）：
+# 語法查證狀態（v1.2.2 更新）：
 #   DeepSNR                    — ✅ 使用者實機驗證成功（-i/-o 短旗標 + -m 模型版本 +
 #     -s stride；-m/-s 沒有固定「正確答案」，依圖片內容/硬體可能需要自行調整，
 #     這裡的 2 / 32 是目前驗證過可用的組合，不代表官方建議預設值）
-#   RC-Astro NoiseXTerminator/  — 語法已對照官方文件確認，尚未在有效授權下實測
-#     StarXTerminator
+#   RC-Astro NoiseXTerminator/  — 語法已對照官方文件確認，仍未在有效授權下實測——
+#     StarXTerminator               這項還是卡在等試用授權審核，跟 v1.2.1 一樣。
 #   GraXpert                   — 語法已對照官方文件確認，尚未實測；{output_noext}
 #     機制是為了它專門加的
-#   StarNet（舊版，位置參數）    — 舊版 CLI 已知是位置參數，跟通用退路慣例本來就
-#     相容，範本留空即可；StarNet2 新版旗標尚未查證，故不列入下拉選單
+#   StarNet2                   — ✅ v1.2.2 已對照官方文件（starnetastro.com/
+#     documentation/starnet/command-line-tool/）確認：StarNet2 用的是具名旗標
+#     `-i/--input`、`-o/--output`（外加可選的 `-m/--mask`、`-n/--unscreen`、
+#     `-u/--upsample`、`-e/--eight`），**不是**位置參數——跟舊版 StarNet 的慣例
+#     不同，原本「應該會沿用舊版慣例」的推測不成立。因此下面另開一個獨立的
+#     StarNet2 範本項目，不能沿用「舊版，位置參數」那一項。
+#   Cosmic Clarity（Denoise）  — ✅ v1.2.2 已直接查證 setiastro/cosmicclarity 原始碼，
+#     確認有 headless CLI 路徑，但走的是「固定 input/output 資料夾」協定，不是
+#     單檔 {input}/{output} 路徑慣例，所以**不透過**這個字典/run_external_image_tool()，
+#     改用專用的 run_cosmic_clarity_denoise()（見上方函式與其開頭的說明區塊）。
+#     這裡列出來只是為了在下拉選單提示使用者「這台工具走另一套路徑，選了會用
+#     不同的呼叫方式」。
 EXTERNAL_TOOL_PROFILES_DENOISE = {
     "自訂 / Custom": "",
     "DeepSNR": "-i {input} -o {output} -m 2 -s 32",
     "RC-Astro NoiseXTerminator": "nxt {input} --output {output} --overwrite",
     "GraXpert": "-cli -cmd denoising {input} -output {output_noext}",
+    "Seti Astro Cosmic Clarity（Denoise，走專用資料夾協定）/ "
+    "Cosmic Clarity Denoise (dedicated folder-based protocol)":
+        "--denoise_strength 0.5 --denoise_mode luminance",
 }
 
 EXTERNAL_TOOL_PROFILES_STAR = {
     "自訂 / Custom": "",
     "RC-Astro StarXTerminator": "sxt {input} --output {output} --overwrite",
     "StarNet（舊版，位置參數）/ Legacy, Positional Args": "",
+    "StarNet2（新版，具名旗標）/ StarNet2, Named Flags": "--input {input} --output {output}",
 }
 
 
@@ -825,7 +968,10 @@ def denoise(img8, enable, mode, d, sigma_color, sigma_space, nlm_h, nlm_h_color,
         return img8
     if mode == "external":
         img01 = img8.astype(np.float32) / 255.0
-        out01, err = run_external_image_tool(img01, ext_path, ext_args)
+        if "--denoise_strength" in (ext_args or ""):
+            out01, err = run_cosmic_clarity_denoise(img01, ext_path, ext_args)
+        else:
+            out01, err = run_external_image_tool(img01, ext_path, ext_args)
         if err is not None:
             print(f"[外部降噪 external denoise] 已跳過，改用原圖（未降噪）: {err}")
             return img8
