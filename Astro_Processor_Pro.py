@@ -653,7 +653,8 @@ def boost_saturation(img01, sat_boost, bright_boost, r_gain, g_gain, b_gain):
 
 
 
-def apply_clarity_and_sharpen(img01, clarity_blur, clarity_strength, sharpen_blur, sharpen_amount):
+def apply_clarity_and_sharpen(img01, clarity_blur, clarity_strength, sharpen_blur, sharpen_amount,
+                               sharpen_mode="internal", sharpen_ext_path="", sharpen_ext_args=""):
     """v1.3.0：改為全程 float32 [0,1] 運算（之前是 uint8 [0,255]）。
 
     clarity_strength / sharpen_amount 都是「原圖與模糊版本之間的差值」乘上的
@@ -665,11 +666,34 @@ def apply_clarity_and_sharpen(img01, clarity_blur, clarity_strength, sharpen_blu
     舊版在 clarity 算完後、銳化前，會先把中間結果量化成 uint8 一次（`clarity =
     np.clip(clarity, 0, 255).astype(np.uint8)`），這是本函式原本唯一的精度損失
     來源，現在移除了。
+
+    v1.3.3：接上 Track A（Cosmic Clarity Sharpen 外部介接）。設計決定（見
+    OPTIMIZATION_PLAN_v1_3_3.md）：Clarity（局部對比）永遠是內建 unsharp-mask
+    運算，不受 sharpen_mode 影響——Cosmic Clarity 官方工具只有「銳化」的 AI
+    模型，沒有對應「clarity」這個效果，兩者不是同一件事的兩種實作方式，
+    所以不適合像 denoise()／去星那樣整段二選一。真正二選一的是「銳化」這
+    個子步驟：
+        sharpen_mode = "internal"（預設）：沿用原本 GaussianBlur + addWeighted
+            的 unsharp-mask 銳化，套用在 clarity 處理完的影像上。
+        sharpen_mode = "external"：改呼叫 run_cosmic_clarity_sharpen()（見該
+            函式），對 clarity 處理完的影像做 AI 銳化。失敗時直接跳過本步驟、
+            回傳「僅套用 clarity、未銳化」的影像，不中斷 pipeline，也不會
+            靜默改用 internal 頂替（避免使用者誤以為套用了 external 設定，
+            實際上卻是內建演算法的結果）。
+    兩種模式都不會疊加銳化兩次（不會內建銳化完再跑一次 external，也不會反過
+    來），避免過度銳化造成光暈／振鈴偽影。
     """
     img_f = img01.astype(np.float32)
     blur = cv2.GaussianBlur(img_f, (0, 0), sigmaX=clarity_blur)
     clarity = img_f + (img_f - blur) * clarity_strength
     clarity = np.clip(clarity, 0, 1).astype(np.float32)
+
+    if sharpen_mode == "external":
+        out01, err = run_cosmic_clarity_sharpen(clarity, sharpen_ext_path, sharpen_ext_args)
+        if err is not None:
+            print(f"[外部銳化 external sharpen] 已跳過，改用僅套用 Clarity、未銳化的影像: {err}")
+            return clarity
+        return np.clip(out01, 0, 1).astype(np.float32)
 
     blur2 = cv2.GaussianBlur(clarity, (0, 0), sigmaX=sharpen_blur)
     sharpened = cv2.addWeighted(clarity, sharpen_amount, blur2, 1 - sharpen_amount, 0)
@@ -818,28 +842,42 @@ def run_external_image_tool(img01, exe_path, extra_args, timeout=_EXTERNAL_TOOL_
 # 協定，差別只在輸出檔名字尾是 "_sharpened" 而不是 "_denoised"。以下直接照
 # run_cosmic_clarity_denoise() 的結構做一份近似複製。
 #
-# ⚠️ 查證狀態跟 run_cosmic_clarity_denoise() 不同，這裡誠實揭露：Denoise 版本
-# 當初有直接讀過官方原始碼，確認 headless CLI 路徑存在且 --denoise_strength
-# 是觸發條件（見上方 run_cosmic_clarity_denoise() 開頭的說明區塊）。Sharpen
-# 版本（SetiAstroCosmicClarity.py）目前只查證了官方文件裡提到的參數語意
-# （Stellar / Non-Stellar / Both 三種類型＋強度＋是否為線性影像），但沒有
-# 逐行讀過它的原始碼來確認實際 headless CLI 旗標拼法（例如強度參數究竟叫
-# --stellar_amount 還是別的名字）。因此下面刻意不像 denoise 版本那樣鎖定
-# 檢查某個特定旗標名稱是否存在，而是退而求其次要求 extra_args 不可為空——
-# 這樣至少能避免使用者完全沒帶任何參數、腳本大機率跳出 Tkinter GUI 導致
-# subprocess 卡住的情況，但不保證使用者帶的旗標名稱本身就是正確的。實際
-# 使用前建議先用 `<exe> --help` 或直接讀 SetiAstroCosmicClarity.py 原始碼
-# 核對一次。
+# ✅ v1.3.3 更新：查證狀態已補齊，跟 run_cosmic_clarity_denoise() 一致。已直接
+# 讀過 github.com/setiastro/cosmicclarity 上 SetiAstroCosmicClarity.py 的
+# 原始碼（非官方文件，是逐行對照 argparse 定義），確認：
+#   - headless 觸發條件：process_images() 開頭判斷
+#     `sharpening_mode is None or nonstellar_strength is None or
+#      stellar_amount is None or nonstellar_amount is None` 才會跳出 PyQt6
+#     GUI（SharpeningConfigDialog）；由於 --stellar_amount／--nonstellar_amount
+#     在 argparse 裡各自有 default=0.9，不傳也不會是 None，實際上「只要」
+#     --sharpening_mode 與 --nonstellar_strength 這兩個沒有預設值的旗標同時
+#     帶到，就一定會走 headless、不會跳窗卡住。
+#   - 實際旗標拼法（確認於 argparse.add_argument 呼叫）：
+#       --sharpening_mode {"Stellar Only","Non-Stellar Only","Both"}（必要，見上）
+#       --nonstellar_strength <float 1-8>（必要，見上）
+#       --stellar_amount <float 0-1>（可選，預設 0.9）
+#       --nonstellar_amount <float 0-1>（可選，預設 0.9）
+#       --disable_gpu（可選旗標，不帶值）
+#       --sharpen_channels_separately（可選旗標，不帶值）
+#       --auto_detect_psf（可選旗標，不帶值）
+#   - 輸出檔名規則跟 run_cosmic_clarity_denoise() 一致：
+#     <原檔名不含副檔名>_sharpened<原副檔名>（TIFF 輸入會維持副檔名不變），
+#     跟下面 out_glob 用的 "*_sharpened.*" 搜尋規則相符，這部分原本就正確、
+#     這次只是一併確認。
+# 因此下面把原本「只要求 extra_args 非空」的寬鬆檢查，改成比照
+# denoise()／run_cosmic_clarity_denoise() 的做法，明確檢查這兩個必要旗標
+# 是否都存在，避免使用者帶了其他參數但漏了其中一個，仍然卡在跳出的 GUI
+# 視窗上（背景 subprocess 會一直等窗口，直到逾時）。
 def run_cosmic_clarity_sharpen(img01, exe_path, extra_args="", timeout=_EXTERNAL_TOOL_TIMEOUT_SEC):
     """呼叫 Seti Astro Cosmic Clarity（Sharpen）處理一張影像。
 
     img01: float32 [0,1] RGB numpy 陣列 (H, W, 3)。
     exe_path: SetiAstroCosmicClarity（Sharpen）執行檔路徑（使用者自行安裝/授權）。
-    extra_args: 直接附加在命令列的旗標字串，需自行對照實際版本的 CLI 說明
-        （或 --help 輸出）帶入正確旗標，例如強度、Stellar/Non-Stellar/Both
-        類型、是否為線性影像等——目前尚未逐一對照原始碼驗證確切旗標拼法
-        （見上方函式開頭的查證狀態說明）。不可留空，否則視為未設定 headless
-        參數，直接跳過本次呼叫，避免卡住等待 GUI。
+    extra_args: 直接附加在命令列的旗標字串。必須同時包含 --sharpening_mode
+        與 --nonstellar_strength（見上方查證說明），否則視為未設定 headless
+        參數，直接跳過本次呼叫，避免卡住等待 GUI。其餘旗標（--stellar_amount /
+        --nonstellar_amount / --disable_gpu / --sharpen_channels_separately /
+        --auto_detect_psf）為可選。
 
     回傳 (out_img01, error_message)，慣例同 run_cosmic_clarity_denoise()：
     失敗時回傳原圖給呼叫端自行決定要不要跳過本步驟。
@@ -849,8 +887,11 @@ def run_cosmic_clarity_sharpen(img01, exe_path, extra_args="", timeout=_EXTERNAL
     exe_path = str(exe_path).strip()
     if not os.path.isfile(exe_path):
         return None, f"找不到 Cosmic Clarity Sharpen 執行檔：{exe_path}"
-    if not (extra_args or "").strip():
-        return None, "額外參數不可留空，否則可能跳出 GUI 視窗導致卡住（未執行）；請帶入 headless 模式所需的旗標"
+    _args_str = extra_args or ""
+    if "--sharpening_mode" not in _args_str or "--nonstellar_strength" not in _args_str:
+        return None, ("額外參數必須同時包含 --sharpening_mode 與 --nonstellar_strength 才會觸發 "
+                       "headless 模式，缺一就可能跳出 GUI 視窗導致卡住（未執行）；"
+                       "請參考範本或官方 SetiAstroCosmicClarity.py 的旗標說明")
 
     exe_dir = os.path.dirname(os.path.abspath(exe_path))
     in_dir = os.path.join(exe_dir, "input")
@@ -1106,6 +1147,29 @@ EXTERNAL_TOOL_PROFILES_STAR = {
     "RC-Astro StarXTerminator": "sxt {input} --output {output} --overwrite",
     "StarNet（舊版，位置參數）/ Legacy, Positional Args": "",
     "StarNet2（新版，具名旗標）/ StarNet2, Named Flags": "--input {input} --output {output}",
+}
+
+# v1.3.3：Cosmic Clarity Sharpen 專用範本字典（比照 EXTERNAL_TOOL_PROFILES_DENOISE
+# 裡「Cosmic Clarity（Denoise）」那一項的做法）。跟 Denoise 一樣走「固定
+# input/output 資料夾」協定，不透過 run_external_image_tool()，改由
+# apply_clarity_and_sharpen() 在 sharpen_mode == "external" 時直接呼叫
+# run_cosmic_clarity_sharpen()。這裡列出來只是為了在下拉選單提示使用者
+# 可用的旗標組合。
+#
+# ✅ 語法查證狀態（v1.3.3）：已直接讀過 setiastro/cosmicclarity 原始碼確認，
+# 見 run_cosmic_clarity_sharpen() 開頭的說明區塊——--sharpening_mode 與
+# --nonstellar_strength 為觸發 headless 模式的必要旗標，其餘為可選。
+EXTERNAL_TOOL_PROFILES_SHARPEN = {
+    "自訂 / Custom": "",
+    "Seti Astro Cosmic Clarity（Sharpen，走專用資料夾協定，Both 模式）/ "
+    "Cosmic Clarity Sharpen (dedicated folder-based protocol, Both mode)":
+        "--sharpening_mode Both --nonstellar_strength 3 --stellar_amount 0.5 --nonstellar_amount 0.5",
+    "Seti Astro Cosmic Clarity（Sharpen，僅 Stellar）/ "
+    "Cosmic Clarity Sharpen (Stellar Only)":
+        "--sharpening_mode \"Stellar Only\" --nonstellar_strength 3 --stellar_amount 0.5",
+    "Seti Astro Cosmic Clarity（Sharpen，僅 Non-Stellar）/ "
+    "Cosmic Clarity Sharpen (Non-Stellar Only)":
+        "--sharpening_mode \"Non-Stellar Only\" --nonstellar_strength 3 --nonstellar_amount 0.5",
 }
 
 
@@ -1534,10 +1598,14 @@ def finish_pipeline(img01, p):
         )
 
     # Step 2: Clarity + 銳化——在乾淨影像上提升局部對比
+    # v1.3.3：Clarity 永遠內建；銳化子步驟依 sharpen_mode 二選一（internal/external）
     img_work = apply_clarity_and_sharpen(
         img_work,
         p['clarity_blur'], p['clarity_strength'],
-        p['sharpen_blur'], p['sharpen_amount']
+        p['sharpen_blur'], p['sharpen_amount'],
+        sharpen_mode=p.get('sharpen_mode', 'internal'),
+        sharpen_ext_path=p.get('sharpen_ext_path', ''),
+        sharpen_ext_args=p.get('sharpen_ext_args', ''),
     )
 
     # Step 3: 飽和度 / 明度 / 通道增益——最後調色，避免色偏擴散
@@ -1868,6 +1936,9 @@ PARAM_NAMES = [
     # 例如 DEFAULTS[24]/DEFAULTS[43] 這類直接以索引取值的地方）
     'denoise_ext_path', 'denoise_ext_args',
     'star_ext_path', 'star_ext_args',
+    # v1.3.3：Track A——Cosmic Clarity Sharpen 外部介接（同樣附加在最後，
+    # 理由同上：避免動到既有參數的索引位置）
+    'sharpen_mode', 'sharpen_ext_path', 'sharpen_ext_args',
 ]
 
 DEFAULTS = [
@@ -1888,6 +1959,7 @@ DEFAULTS = [
     "rectangle",
     "", "",
     "", "",
+    "internal", "", "",
 ]
 
 def collect_params(values):
@@ -2282,10 +2354,12 @@ def local_preview_fn(full_img, x_pct, y_pct, crop_px, lang, *param_values):
 
 
 def export_fn(full_img, out_dir, out_name, want_layers, lang, export_formats, *param_values):
-
+    # v1.3.3 Track B：新增第 3 個回傳值 elapsed（原始 float 秒數，不是格式化字串），
+    # 提供給呼叫端的 .then() 串接餵給 get_status_bar_html(proc_time=...)，讓底部
+    # 狀態列的「⏱ 時間」欄位第一次真正顯示數值。訊息文字本身格式不變。
     if full_img is None:
         msg = "⚠️ 請先載入圖片" if lang == "zh" else "⚠️ Please load an image first"
-        return msg, None
+        return msg, None, None
     if not out_name:
         out_name = "processed"
     p = collect_params(param_values)
@@ -2307,12 +2381,14 @@ def export_fn(full_img, out_dir, out_name, want_layers, lang, export_formats, *p
         msg = (f"✅ 匯出完成，共 {len(files)} 個檔案，總耗時 {elapsed:.2f}s → `{out_dir}`"
                if lang == "zh" else
                f"✅ Export completed, {len(files)} files, total {elapsed:.2f}s → `{out_dir}`")
-        return msg, files
+        return msg, files, elapsed
     except Exception as e:
         elapsed = time.perf_counter() - t0
         err_msg = (f"❌ 匯出失敗（耗時 {elapsed:.2f}s）: {e}" if lang == "zh"
                    else f"❌ Export failed (after {elapsed:.2f}s): {e}")
-        return err_msg, None
+        # 失敗仍回傳 elapsed（失敗前實際花了多久），比留白／None 更有資訊量，
+        # 也讓狀態列不會因為一次失敗的匯出就整個「消失」數值。
+        return err_msg, None, elapsed
 
 
 def batch_process_fn(folder, out_dir, want_layers, lang, stop_state, formats, *param_values):
@@ -2625,6 +2701,34 @@ UI_TRANSLATIONS = {
     "sharpen_amount": {
         "zh": ("銳化程度", "過大會使雜訊粒子變粗"),
         "en": ("Sharpen Amount", "Too high will make noise grain coarser"),
+    },
+    "sharpen_mode": {
+        "zh": ("銳化模式", "Clarity 永遠套用內建演算法；此處只切換「銳化」子步驟：internal=沿用上方模糊半徑/程度的 unsharp-mask; external=改呼叫外部 Cosmic Clarity Sharpen（見下方設定）"),
+        "en": ("Sharpen Mode", "Clarity always uses the built-in algorithm; this only switches the sharpening sub-step: internal = the unsharp-mask above (blur radius/amount); external = calls external Cosmic Clarity Sharpen (see settings below)"),
+    },
+    "sharpen_ext_path": {
+        "zh": ("[external]Cosmic Clarity Sharpen 執行檔路徑",
+               "呼叫使用者電腦上『自行安裝、自行取得授權』的 Seti Astro Cosmic Clarity（Sharpen）；"
+               "本程式不內建、不重新散布任何第三方模型，授權責任由使用者自行負責。找不到執行檔或呼叫失敗時，"
+               "本步驟會自動跳過並回傳僅套用 Clarity、未銳化的影像，不會中斷處理。"),
+        "en": ("[external] Cosmic Clarity Sharpen Executable Path",
+               "Calls Seti Astro Cosmic Clarity (Sharpen) that the user has installed and licensed themselves. "
+               "This app never bundles or redistributes third-party models — licensing responsibility stays "
+               "with the user. If the executable is missing or the call fails, this step is skipped and the "
+               "Clarity-only (unsharpened) image is returned; the pipeline is not interrupted."),
+    },
+    "sharpen_ext_profile": {
+        "zh": ("[external]工具範本（自動帶入下方參數）",
+               "選了範本會自動把對應語法填進「額外命令列參數」欄位，仍可手動再調整；"
+               "旗標已對照 setiastro/cosmicclarity 原始碼確認，詳見優化計畫文件。"),
+        "en": ("[external] Tool Preset (auto-fills the field below)",
+               "Selecting a preset auto-fills the matching syntax into \"Extra Command-line Arguments\"; "
+               "you can still edit it manually afterward. Flags have been verified against the "
+               "setiastro/cosmicclarity source — see the optimization plan document for details."),
+    },
+    "sharpen_ext_args": {
+        "zh": ("[external]額外命令列參數", "必須同時包含 --sharpening_mode 與 --nonstellar_strength 才會觸發 headless 模式，否則會跳過本次呼叫；其餘旗標可選"),
+        "en": ("[external] Extra Command-line Arguments", "Must include both --sharpening_mode and --nonstellar_strength to trigger headless mode, otherwise the call is skipped; other flags are optional"),
     },
     "denoise_enable": {"zh": "啟用降噪", "en": "Enable Denoise"},
     "denoise_mode": {
@@ -3523,6 +3627,68 @@ custom_js = """
 }
 """
 
+def _sharpen_mode_visibility(mode_val):
+    """v1.3.3 追加：mode == "internal" 時隱藏 external 三欄；mode == "external"
+    時反過來隱藏 internal 用的 sharpen_blur/sharpen_amount 兩顆滑桿——兩組欄位
+    互斥且沒有交叉依賴（sharpen 只有這兩種模式，internal 滑桿只在
+    apply_clarity_and_sharpen() 的 internal 分支被讀取，external 分支完全不會
+    用到），可以放心兩邊都隱藏。
+    """
+    is_ext = (mode_val == "external")
+    return (
+        gr.update(visible=not is_ext),  # sharpen_blur
+        gr.update(visible=not is_ext),  # sharpen_amount
+        gr.update(visible=is_ext),      # sharpen_ext_path
+        gr.update(visible=is_ext),      # sharpen_ext_profile
+        gr.update(visible=is_ext),      # sharpen_ext_args
+    )
+
+
+def _denoise_mode_visibility(mode_val):
+    """v1.3.3 追加：denoise() 讀過原始碼確認過 d/sigma_color/sigma_space 只在
+    mode=="fast" 分支用到、nlm_h/nlm_h_color 只在 mode=="quality" 分支用到，
+    彼此不共用、也沒有其他函式跨模式讀取這幾個欄位，三組（fast/quality/
+    external）可以互斥顯示，不會藏到其實還有作用的欄位。
+    """
+    return (
+        gr.update(visible=mode_val == "fast"),      # denoise_d
+        gr.update(visible=mode_val == "fast"),      # denoise_sigma_color
+        gr.update(visible=mode_val == "fast"),      # denoise_sigma_space
+        gr.update(visible=mode_val == "quality"),   # denoise_nlm_h
+        gr.update(visible=mode_val == "quality"),   # denoise_nlm_h_color
+        gr.update(visible=mode_val == "external"),  # denoise_ext_path
+        gr.update(visible=mode_val == "external"),  # denoise_ext_profile
+        gr.update(visible=mode_val == "external"),  # denoise_ext_args
+    )
+
+
+def _star_mode_visibility(mode_val):
+    """v1.3.3 追加：只隱藏 star_shrink_kernel/star_shrink_iter/star_shrink_strength
+    這三個「[縮星]」欄位（`process_stars()` 讀過確認只有 mode=="shrink" 分支
+    會用到，其他分支完全不讀），mode!="shrink" 時收起來。
+
+    刻意*不*對星點偵測欄位（star_kernel/star_thresh/...）和「[去星]」欄位
+    （star_inpaint_radius/star_feather_px/star_noise_strength）做同樣的事，
+    即使乍看也是「只有 remove 模式才用得到」：讀過 finish_pipeline() 才發現
+    `need_mask = star_mode != 'none' or want_layers`，且只要 want_layers=True
+    （按「產生圖層」預覽、或匯出/批次勾選「同時輸出去星圖層」），不管主畫面
+    選的是 shrink／none／external，都會強制跑一次完整的多尺度去星去產生
+    starless 圖層——這時候用的正是偵測欄位跟這三個「[去星]」欄位。如果照
+    mode 隱藏，會讓使用者在 shrink 模式下調不到其實仍在運作的圖層去星參數，
+    比目前「全部顯示」更容易誤導，所以維持不動。
+    """
+    show_shrink = (mode_val == "shrink")
+    show_ext = (mode_val == "external")
+    return (
+        gr.update(visible=show_shrink),  # star_shrink_kernel
+        gr.update(visible=show_shrink),  # star_shrink_iter
+        gr.update(visible=show_shrink),  # star_shrink_strength
+        gr.update(visible=show_ext),     # star_ext_path
+        gr.update(visible=show_ext),     # star_ext_profile
+        gr.update(visible=show_ext),     # star_ext_args
+    )
+
+
 with gr.Blocks(
     title="🌌 Astro Processor Pro",
 ) as demo:
@@ -3543,6 +3709,14 @@ with gr.Blocks(
     # 不到。改成傳同一個 dict 物件、用「原地修改」（stop_state["stop"] = True）
     # 而不是整個替換掉，批次迴圈裡每次檢查的才會是同一份、被按鈕即時改過的資料。
     state_batch_stop    = gr.State({"stop": False})
+
+    # v1.3.3 Track B：狀態列「⏱ 時間」欄位過去從未被接上過任何實際數值
+    # （get_status_bar_html 的 proc_time 參數一直收到 None）。決定讓狀態列
+    # 反映「最近一次匯出」的耗時——export_fn 已經算過 elapsed，只是沒有把
+    # 原始 float 一併回傳；現在額外用這個 State 存起來，load_btn / export_btn /
+    # lang_radio 三個既有呼叫點都改成把它一起傳給 get_status_bar_html()，
+    # 這樣不管哪個觸發，狀態列顯示的都是同一個「最近一次匯出耗時多久」。
+    state_last_export_time = gr.State(None)
 
     # ── Top Toolbar (Gradio Row) ──────────────────────────────
     with gr.Row(elem_id="pro-toolbar-row", equal_height=True):
@@ -3744,8 +3918,45 @@ with gr.Blocks(
                         with gr.Accordion("5️⃣ Clarity(局部對比) / 銳化", open=False) as acc_clarity:
                             clarity_blur     = gr.Slider(1,   60,  value=25,   step=1,    label="Clarity 模糊半徑", info="越大越偏向中尺度結構")
                             clarity_strength = gr.Slider(0,   1,   value=0.35, step=0.01, label="Clarity 強度", info="類似 Lightroom 清晰度")
-                            sharpen_blur     = gr.Slider(0.5, 10,  value=2,    step=0.1,  label="銳化模糊半徑", info="決定銳化鎖定的細節尺度，越大銳化範圍越粗")
-                            sharpen_amount   = gr.Slider(0.5, 3,   value=1.25, step=0.01, label="銳化程度", info="過大會使雜訊粒子變粗")
+                            sharpen_mode     = gr.Radio(
+                                ["internal", "external"], value="internal",
+                                label=UI_TRANSLATIONS["sharpen_mode"]["zh"][0],
+                                info=UI_TRANSLATIONS["sharpen_mode"]["zh"][1],
+                            )
+                            sharpen_blur     = gr.Slider(0.5, 10,  value=2,    step=0.1,  label="[internal]銳化模糊半徑", info="決定銳化鎖定的細節尺度，越大銳化範圍越粗")
+                            sharpen_amount   = gr.Slider(0.5, 3,   value=1.25, step=0.01, label="[internal]銳化程度", info="過大會使雜訊粒子變粗")
+                            sharpen_ext_path    = gr.Textbox(
+                                label=UI_TRANSLATIONS["sharpen_ext_path"]["zh"][0], value="",
+                                placeholder="例如：C:\\Tools\\CosmicClaritySharpen\\SetiAstroCosmicClarity.exe",
+                                info=UI_TRANSLATIONS["sharpen_ext_path"]["zh"][1],
+                                visible=False,
+                            )
+                            sharpen_ext_profile = gr.Dropdown(
+                                choices=list(EXTERNAL_TOOL_PROFILES_SHARPEN.keys()),
+                                value="自訂 / Custom",
+                                label=UI_TRANSLATIONS["sharpen_ext_profile"]["zh"][0],
+                                info=UI_TRANSLATIONS["sharpen_ext_profile"]["zh"][1],
+                                visible=False,
+                            )
+                            sharpen_ext_args    = gr.Textbox(
+                                label=UI_TRANSLATIONS["sharpen_ext_args"]["zh"][0], value="",
+                                placeholder="例如：--sharpening_mode Both --nonstellar_strength 3 --stellar_amount 0.5 --nonstellar_amount 0.5",
+                                info=UI_TRANSLATIONS["sharpen_ext_args"]["zh"][1],
+                                visible=False,
+                            )
+                            sharpen_ext_profile.change(
+                                fn=lambda name: EXTERNAL_TOOL_PROFILES_SHARPEN.get(name, ""),
+                                inputs=[sharpen_ext_profile], outputs=[sharpen_ext_args],
+                            )
+                            # v1.3.3：mode 不是 external 時，external 三個欄位跟使用者無關；
+                            # mode 是 external 時，internal 專用的兩顆滑桿反過來跟使用者無關。
+                            # 兩邊都做，面板才不會一直混著一堆用不到的控制項。
+                            sharpen_mode.change(
+                                fn=_sharpen_mode_visibility,
+                                inputs=[sharpen_mode],
+                                outputs=[sharpen_blur, sharpen_amount,
+                                         sharpen_ext_path, sharpen_ext_profile, sharpen_ext_args],
+                            )
 
                         with gr.Accordion("6️⃣ 降噪", open=False) as acc_denoise:
                             denoise_enable      = gr.Checkbox(label="啟用降噪", value=DEFAULTS[24])
@@ -3753,30 +3964,40 @@ with gr.Blocks(
                             denoise_d           = gr.Slider(1, 15, value=5,  step=1, label="[fast]濾波視窗", info="較大數值降噪範圍廣但耗時")
                             denoise_sigma_color = gr.Slider(1, 50, value=15, step=1, label="[fast]顏色 Sigma", info="越高越能融合差異較大的顏色，但可能糊掉色彩邊界")
                             denoise_sigma_space = gr.Slider(1, 50, value=15, step=1, label="[fast]空間 Sigma", info="越高影響範圍越大的鄰近像素，降噪更平滑但更慢")
-                            denoise_nlm_h       = gr.Slider(1, 30, value=10, step=1, label="[quality]亮度降噪強度 h", info="越高越乾淨，但可能抹掉細節")
-                            denoise_nlm_h_color = gr.Slider(1, 30, value=10, step=1, label="[quality]色彩降噪強度 hColor", info="越高色彩雜訊越乾淨，但可能造成色塊化")
+                            denoise_nlm_h       = gr.Slider(1, 30, value=10, step=1, label="[quality]亮度降噪強度 h", info="越高越乾淨，但可能抹掉細節", visible=False)
+                            denoise_nlm_h_color = gr.Slider(1, 30, value=10, step=1, label="[quality]色彩降噪強度 hColor", info="越高色彩雜訊越乾淨，但可能造成色塊化", visible=False)
                             denoise_ext_path    = gr.Textbox(
                                 label="[external]外部降噪工具執行檔路徑", value="",
                                 placeholder="例如：C:\\Tools\\NoiseXTerminator\\nxt_cli.exe",
                                 info="呼叫使用者電腦上『自行安裝、自行取得授權』的外部降噪工具(如 NoiseXTerminator / DeepSNR CLI)；"
                                      "本程式不內建、不重新散布任何第三方模型，授權責任由使用者自行負責。找不到執行檔或呼叫失敗時，"
                                      "本步驟會自動跳過並回傳未降噪的原圖，不會中斷處理。",
+                                visible=False,
                             )
                             denoise_ext_profile = gr.Dropdown(
                                 choices=list(EXTERNAL_TOOL_PROFILES_DENOISE.keys()),
                                 value="自訂 / Custom",
                                 label=UI_TRANSLATIONS["denoise_ext_profile"]["zh"][0],
                                 info=UI_TRANSLATIONS["denoise_ext_profile"]["zh"][1],
+                                visible=False,
                             )
                             denoise_ext_args    = gr.Textbox(
                                 label="[external]額外命令列參數", value="",
                                 placeholder="可用 {input} / {output} / {output_noext} 佔位符；留空則預設為「執行檔 輸入檔 輸出檔」",
                                 info="若外部工具的命令列語法不是單純的「輸入檔 輸出檔」，可在此用 {input}/{output} 自訂順序與其他參數；"
                                      "若工具會自己補副檔名（如 GraXpert），改用 {output_noext}。",
+                                visible=False,
                             )
                             denoise_ext_profile.change(
                                 fn=lambda name: EXTERNAL_TOOL_PROFILES_DENOISE.get(name, ""),
                                 inputs=[denoise_ext_profile], outputs=[denoise_ext_args],
+                            )
+                            denoise_mode.change(
+                                fn=_denoise_mode_visibility,
+                                inputs=[denoise_mode],
+                                outputs=[denoise_d, denoise_sigma_color, denoise_sigma_space,
+                                         denoise_nlm_h, denoise_nlm_h_color,
+                                         denoise_ext_path, denoise_ext_profile, denoise_ext_args],
                             )
 
                         with gr.Accordion("7️⃣ 星點縮小 / 去星", open=False) as acc_star:
@@ -3800,22 +4021,31 @@ with gr.Blocks(
                                 info="呼叫使用者電腦上『自行安裝、自行取得授權』的外部去星工具(如 StarXTerminator / StarNet CLI)；"
                                      "本程式不內建、不重新散布任何第三方模型，授權責任由使用者自行負責。找不到執行檔或呼叫失敗時，"
                                      "本步驟會自動跳過並回傳未去星的原圖，不會中斷處理。",
+                                visible=False,
                             )
                             star_ext_profile    = gr.Dropdown(
                                 choices=list(EXTERNAL_TOOL_PROFILES_STAR.keys()),
                                 value="自訂 / Custom",
                                 label=UI_TRANSLATIONS["star_ext_profile"]["zh"][0],
                                 info=UI_TRANSLATIONS["star_ext_profile"]["zh"][1],
+                                visible=False,
                             )
                             star_ext_args       = gr.Textbox(
                                 label="[external]額外命令列參數", value="",
                                 placeholder="可用 {input} / {output} / {output_noext} 佔位符；留空則預設為「執行檔 輸入檔 輸出檔」",
                                 info="若外部工具的命令列語法不是單純的「輸入檔 輸出檔」，可在此用 {input}/{output} 自訂順序與其他參數；"
                                      "若工具會自己補副檔名，改用 {output_noext}。",
+                                visible=False,
                             )
                             star_ext_profile.change(
                                 fn=lambda name: EXTERNAL_TOOL_PROFILES_STAR.get(name, ""),
                                 inputs=[star_ext_profile], outputs=[star_ext_args],
+                            )
+                            star_mode.change(
+                                fn=_star_mode_visibility,
+                                inputs=[star_mode],
+                                outputs=[star_shrink_kernel, star_shrink_iter, star_shrink_strength,
+                                         star_ext_path, star_ext_profile, star_ext_args],
                             )
 
                         with gr.Accordion("7️⃣b 大範圍偵測(密集星團/大片暈光)", open=False) as acc_cluster:
@@ -3917,6 +4147,18 @@ with gr.Blocks(
                     with gr.Row():
                         batch_btn = gr.Button("🚀 開始批次處理整個資料夾", variant="primary")
                         batch_stop_btn = gr.Button("⏹ 停止批次", variant="stop")
+                    # v1.3.3 Track B：停止旗標是逐張圖片邊界檢查，這是設計本身
+                    # （不會留下寫到一半的殘檔），但如果降噪／去星／銳化目前是
+                    # external 模式，正在跑的那張圖要等外部工具的 subprocess
+                    # 結束或撞到逾時（預設 180 秒）才會走到下一次檢查點——決定
+                    # 先把這個既有行為寫清楚，而不是實作提早中止 subprocess
+                    # （那需要把 Popen+poll 換掉現在會卡住的 subprocess.run）。
+                    batch_stop_hint = gr.Markdown(
+                        "ℹ️ 停止會在**目前這張圖片處理完後**才生效；"
+                        "若降噪／去星／銳化正使用 external 模式呼叫外部工具，"
+                        "最長可能要等到該外部工具逾時（預設 180 秒）才會真正停下。",
+                        elem_id="batch-stop-hint",
+                    )
                     batch_status = gr.Markdown("")
 
                 # ── Tab: Local ROI Preview ────────────────────
@@ -3997,6 +4239,7 @@ with gr.Blocks(
         manual_target_shape,
         denoise_ext_path, denoise_ext_args,
         star_ext_path, star_ext_args,
+        sharpen_mode, sharpen_ext_path, sharpen_ext_args,
     ]
 
     sliders_for_release = [
@@ -4016,7 +4259,7 @@ with gr.Blocks(
         manual_target_x_pct, manual_target_y_pct, manual_target_w_pct, manual_target_h_pct,
         manual_target_weight, manual_target_feather_pct,
     ]
-    toggles_for_change = [bg_enable, wb_enable, local_target_enable, manual_target_enable, manual_target_shape, denoise_enable, denoise_mode, star_mode, multiscale_enable]
+    toggles_for_change = [bg_enable, wb_enable, local_target_enable, manual_target_enable, manual_target_shape, denoise_enable, denoise_mode, star_mode, multiscale_enable, sharpen_mode]
 
     # Preview common inputs / outputs
     _PREV_IN  = [state_preview_base, state_preview_scale, state_full,
@@ -4068,8 +4311,12 @@ with gr.Blocks(
         (b_gain, "b_gain"),
         (clarity_blur, "clarity_blur"),
         (clarity_strength, "clarity_strength"),
+        (sharpen_mode, "sharpen_mode"),
         (sharpen_blur, "sharpen_blur"),
         (sharpen_amount, "sharpen_amount"),
+        (sharpen_ext_path, "sharpen_ext_path"),
+        (sharpen_ext_profile, "sharpen_ext_profile"),
+        (sharpen_ext_args, "sharpen_ext_args"),
         (denoise_enable, "denoise_enable"),
         (denoise_mode, "denoise_mode"),
         (denoise_d, "denoise_d"),
@@ -4264,7 +4511,7 @@ with gr.Blocks(
         outputs=_PREV_OUT,
     ).then(
         fn=get_status_bar_html,
-        inputs=[state_lang],
+        inputs=[state_last_export_time, state_lang],
         outputs=[status_bar_out],
     )
 
@@ -4360,10 +4607,10 @@ with gr.Blocks(
     export_btn.click(
         fn=export_fn,
         inputs=[state_full, output_dir, output_name, save_layers, state_lang, export_formats] + PARAM_COMPONENTS,
-        outputs=[export_status, export_files],
+        outputs=[export_status, export_files, state_last_export_time],
     ).then(
         fn=get_status_bar_html,
-        inputs=[state_lang],
+        inputs=[state_last_export_time, state_lang],
         outputs=[status_bar_out],
     )
 
@@ -4380,18 +4627,28 @@ with gr.Blocks(
     # 印出正常的「已停止」摘要訊息），另外也用 Gradio 內建的 cancels 機制
     # 保底：萬一某次呼叫卡在檢查點之間很久沒有 yield（例如單張圖片處理
     # 特別慢），至少 Gradio 佇列本身也會嘗試中止這個事件。
-    def request_batch_stop_fn(stop_state, lang):
+    def request_batch_stop_fn(stop_state, lang, denoise_mode_val, star_mode_val, sharpen_mode_val):
         if isinstance(stop_state, dict):
             stop_state["stop"] = True
         else:
             stop_state = {"stop": True}
         msg = ("⏹ 已送出停止要求，將在目前這張圖片處理完後停止批次…" if lang == "zh"
                else "⏹ Stop requested — batch will halt after the current file finishes…")
+        # v1.3.3 Track B：如果目前是 external 模式，額外提醒使用者「這張」可能
+        # 要等外部工具的 subprocess 結束或逾時才會真的停下，避免使用者以為
+        # 按了沒反應（見 batch_stop_hint 的固定說明，這裡是按下當下的即時提醒）。
+        if "external" in (denoise_mode_val, star_mode_val, sharpen_mode_val):
+            msg += (
+                "（目前有步驟使用 external 模式，這張圖可能要再等外部工具"
+                "結束或逾時才會真正停止）" if lang == "zh" else
+                " (an external-tool step is active, so the current file may take "
+                "until that tool finishes or times out before it truly stops)"
+            )
         return stop_state, msg
 
     batch_stop_btn.click(
         fn=request_batch_stop_fn,
-        inputs=[state_batch_stop, state_lang],
+        inputs=[state_batch_stop, state_lang, denoise_mode, star_mode, sharpen_mode],
         outputs=[state_batch_stop, batch_status],
     ).then(
         fn=None, inputs=None, outputs=None, cancels=[batch_event], queue=False,
@@ -4478,6 +4735,18 @@ with gr.Blocks(
     # 勾選框關閉時回傳 active=False 的 Timer 更新，暫停輪詢，
     # 手動按鈕在暫停狀態下仍可正常使用。
     monitor_timer.tick(fn=get_system_stats_html, outputs=[monitor_html])
+
+    # v1.3.3 Track B：status_bar_out 過去完全沒有定時刷新，只在
+    # load_btn/export_btn/lang_radio 三個離散觸發點才重算一次，RAM/GPU
+    # 數字在觸發點之間會停在舊值、看起來像卡住。做法比照 monitor_html
+    # 已經驗證過的模式：重用同一顆 monitor_timer，多掛一個 tick 目標即可，
+    # 不需要新的計時器或新的運算邏輯。勾選框關閉 monitor_timer 時，這裡
+    # 也會一併暫停，行為跟監控面板保持一致。
+    monitor_timer.tick(
+        fn=get_status_bar_html,
+        inputs=[state_last_export_time, state_lang],
+        outputs=[status_bar_out],
+    )
     monitor_auto_refresh.change(
         fn=lambda enabled: gr.Timer(value=3, active=bool(enabled)),
         inputs=[monitor_auto_refresh],
@@ -4500,7 +4769,7 @@ with gr.Blocks(
                    snap_a_status, snap_b_status, snap_c_status]
     ).then(
         fn=get_status_bar_html,
-        inputs=[state_lang],
+        inputs=[state_last_export_time, state_lang],
         outputs=[status_bar_out]
     )
 
